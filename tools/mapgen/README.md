@@ -94,6 +94,47 @@ the sets are clearly test-specific), `hierarchy` 1294 classes / 1996 edges /
 892 direct `Expression` subclasses, and 0 integrity errors. Two identical runs
 of that target are byte-identical for every file in the bundle (sha256).
 
+## W1g plumbing run: merged class-body copies + v3 classification (~17 s)
+
+Snowflake (escape-rich SQL), postgres (`\x44` / `\176`) and one pool-driven
+optimizer test, i.e. parent + child traces:
+
+```sh
+mkdir -p /tmp/w1g-plumb-1 /tmp/w1g-plumb-2
+for out in /tmp/w1g-plumb-1 /tmp/w1g-plumb-2; do
+  docker run --rm --platform linux/amd64 -v "$out":/out blast-mapgen /out \
+    'tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake' \
+    'tests/dialects/test_postgres.py::TestPostgres::test_postgres' \
+    'tests/test_optimizer.py::TestOptimizer::test_eliminate_joins'
+done
+python3 tools/mapgen/inspect_maps.py --maps /tmp/w1g-plumb-1   # -> 0 error(s)
+```
+
+Findings (all reproducible from the bundle):
+
+* 184 sqlglot files, `keyreads` 20 026 (test, NAME, key) pairs / 3 tests,
+  152 `keyable` / 1 617 `opaque` / 1 636 `unclassified`, 0 `unplaced`,
+  `reclassified` 31, `coarse_blocked` 0.
+* `Snowflake.Tokenizer.NUMERIC_ESCAPES` (table `{"x", "u", "0"}`) is
+  `keyable`; its recorded reads for `test_snowflake` are `'\''` and `'\\'` —
+  exactly the escapes `r"SELECT 'a \' \\ \\t \\x21 z $ '"` exercises (`\x21` is
+  behind a doubled backslash, so `x` is *not* exercised by that input) — and
+  `u` has **zero** readers anywhere in the bundle.
+* `Postgres.Tokenizer.NUMERIC_ESCAPES` reads `'`, `0`, `n`, `t`, `x`: `x` comes
+  from `e'\x44'` and `0` from `\176`, so exercised numeric escapes are recorded.
+* `Snowflake.UNESCAPED_SEQUENCES` (a metaclass **merged copy**) records reads
+  (`''`, `\'`, `\\`), which is the post-creation pass working; it stays `opaque`
+  because it is merged with `**` in `dialect.py`.
+* Two identical runs: all 12 `*.gz`/`*.json` outputs and `MANIFEST.json` are
+  byte-identical (sha256), including the 11 child traces of the pool target.
+* Parity: plain vs traced pytest on the same three targets gives
+  `3 passed, 1193 subtests passed` both ways (traced 5.0 s vs plain 3.7 s).
+* Cost check on a wider set (`tests/test_tokens.py tests/test_parser.py
+  tests/dialects/test_{snowflake,bigquery,hive}.py`, 298 tests): 118.3 s traced
+  vs 119.3 s for the pre-W1g image and 22.2 s plain — the 5× denominator is the
+  pre-existing coverage cost of `test_parser.py::test_max_nodes` (112 s traced,
+  91 s with `BR_KEYREADS=0`), not the new proxying.
+
 ## Stages
 
 1. **Build** – `fetch_pin.py` downloads `codeload.github.com/…/tar.gz/<sha>`
@@ -133,6 +174,36 @@ of that target are byte-identical for every file in the bundle (sha256).
      to plain containers. `BR_KEYREADS=0` / `BR_DIALECTS=0` disable either
      trace; `BR_KEYREADS_SCOPE=core` proxies only the highest-value tables
      (kept as a speed escape hatch; not needed, see timing below).
+   * **Post-creation re-proxying (W1g)**: the `Dialect` metaclass
+     (`_Dialect.__new__`) and `_TokenizerBase.__init_subclass__` build *new
+     plain* containers while a class is created — merged copies
+     (`UNESCAPED_SEQUENCES`, `ESCAPED_SEQUENCES`, `TIME_TRIE`, `INVERSE_*`),
+     rebuilt tokenizer tables (`_QUOTES`, `_FORMAT_STRINGS`, `_KEYWORD_TRIE`,
+     `_COMMENTS`, `_STRING_ESCAPES`) and freshly `type()`-created
+     `tokenizer_class`/`jsonpath_tokenizer_class`/`parser_class`/
+     `generator_class` objects. `_patch_module` only descends into classes
+     *defined in the module it just ran*, so it misses the metaclass-built
+     classes; `_repatch_class` walks the class bodies again after every sqlglot
+     module import (id-guarded, follows role attributes across modules, max
+     depth 4) plus one final sweep at collection end. Measured at the pin: **496
+     extra class containers on 61 classes, and zero plain
+     dict/list/set/tuple/frozenset attributes left on any sqlglot class** (was
+     248, all of them `JSONPathTokenizer`/dynamic-tokenizer tables).
+     `BR_KEYREADS_NESTED=1` additionally proxies one level of sub-containers for
+     "dict of small tables" constants (recorded as `NAME[key]`); off by default
+     because those names have no static definition yet (+19 KB gzipped on a
+     one-test plumbing run, no selector consumer).
+   * **Coarse markers (W1g)**: a proxy cannot attribute a wholesale read to a
+     key, so `__iter__`/`keys`/`items`/`values`/`copy`/`update`/`pop`/
+     `setdefault`/`__setitem__`/set algebra/`__repr__` record the *name* in a
+     global (import time included) `bulk` set instead. Defining `__iter__` also
+     routes `{**X}`/`dict(X)` through `keys()` + `__getitem__` (CPython's
+     `PyDict_Merge` fast path only applies to subtypes keeping the builtin
+     iterator), so a merge is both visible and marked. `gen_maps.py` demotes
+     every name in that set to `opaque`. Key reads raised *while a sqlglot
+     module executes* are routed to the sink, so a dialect imported lazily
+     inside a test never has its import-time merges attributed to that test
+     (this alone removed 7 400 spurious pairs on one snowflake test).
    * **Expression construction (L4)**: the `__init__` every
      `sqlglot.expressions.Expression` subclass executes is wrapped once, right
      after `sqlglot.expressions.core` is imported, and records the qualified
@@ -230,6 +301,34 @@ slice, `"<DType.INT: …>"` for enum members). Reads with no current test
 assignment aliasing, deletion) makes it `opaque`. Names observed at runtime but
 not statically located (e.g. `Class.required_args`, computed by
 `__init_subclass__`) are `opaque`. Only `keyable` names may ever be narrowed on.
+
+**v3 classification (W1g).** The rule above is kept as the base, but the
+"opaque" reasons are now sorted by what they can actually do to the container
+(`MANIFEST.json: keyreads.classification` records the outcome):
+
+| reason class | shapes | verdict |
+| --- | --- | --- |
+| `keyed` | `X[k]`, `X.get(k)`, `X.__contains__(k)`, `k in X` | fine |
+| `presence` | `if X:`/`bool(X)`/`not X` (reads no key, only emptiness) | forgiven |
+| `alias` | `y = X`, `f(k=X)`, `return X`, `(X, Y)`, `{"k": X}` — same object, so keyed reads still land on `NAME` | forgiven |
+| `hard` | iteration, `.items()/.keys()/.values()/.copy()`, `{**X}`, `dict(X)`, `X \| Y`, `*X`, equality, f-string, `X[k] = v`, `.pop/.update/.setdefault/...`, calling `X` | `opaque`, wherever it occurs |
+
+Extra guards: a name needs at least one genuinely keyed reference (a table that
+is only aliased or only truthiness-tested stays `opaque` exactly as before), and
+any name in the runtime `bulk` set is demoted to `opaque` — that is the safety
+net for a copy/merge made *through* an alias, which no static rule can see
+through. At the pin this reclassifies **31 names** (`reclassified`), all of them
+`*.Tokenizer.NUMERIC_ESCAPES` plus a dozen `Parser.*` token tables — e.g.
+`Snowflake.Tokenizer.NUMERIC_ESCAPES` is now `keyable` (its only non-keyed uses
+are `numeric_escapes = klass.tokenizer_class.NUMERIC_ESCAPES`, a `kwarg`
+hand-off and one `bool(...)`), while `UNESCAPED_SEQUENCES` / `ESCAPED_SEQUENCES`
+/`KEYWORDS` correctly stay `opaque` (they are merged with `{**X}`/`.items()`).
+
+Residual risk to keep in mind for L3: a `presence` reference only observes
+emptiness, so a patch that *adds or removes* an entry (rather than changing a
+value) can affect a truthiness-only reader that L3 would not select. L3's own
+"≥5 tests read other keys of the same constant" gate blocks that for any table
+that is not key-read by many tests, and `make sample` is the calibration.
 
 ### testimports.json.gz
 
@@ -460,10 +559,15 @@ real v2 cost is the extra spawn workers' instrumentation, which only exists for
   return plain containers) and runtime-computed class attributes such as
   `Expr.required_args` cannot be followed statically; any such name that shows
   up in the trace is classified `opaque` in `gen_maps.py` and counted as
-  `unclassified` in the log/MANIFEST.
-* **`capture.version` is 3** (was 2): the bundle gained the class-construction
-  trace and the usage-style split. `class_trace` / `usage_style` flags record
-  that; readers that gate on `>= 2` keep working.
+  `unclassified` in the log/MANIFEST. Since v4 the post-creation pass also
+  registers the metaclass-built tables (`Tokenizer._QUOTES`,
+  `JSONPathTokenizer._KEYWORD_TRIE`, …) under their class' `__qualname__`; they
+  have no static definition either, so they are `unclassified` too (`1612` →
+  `1636` on the plumbing set, `6421` with `BR_KEYREADS_NESTED=1`).
+* **`capture.version` is 4** (was 3): the bundle gained the post-creation
+  re-proxying pass (`merged_class_reproxy`) and the coarse-access markers
+  (`coarse_markers`), plus the v3 `usage_kind` classification notes under
+  `MANIFEST.keyreads.classification`. Readers that gate on `>= 2` keep working.
 * **`__init__` override audit** (asked for by W1e): 41 classes in `sqlglot/`
   define their own `__init__`. Only three sit on the `Expression` construction
   path: `Expr` (the wrapped slot itself -- it *is* `Expression.__init__`'s
@@ -495,11 +599,9 @@ real v2 cost is the extra spawn workers' instrumentation, which only exists for
   universe is captured (`classes.touched`, `dialects.exposure`); for any other
   family (Tokenizer/Parser/Generator class bodies) `instance_lines` stays in
   the union.
-* **`inspect_maps.py` still validates the old 2-key split**: it requires
-  `{"self_lines", "other_lines"}`, so it reports one `bad split` error per
-  file entry for the new map. Validating the 3-key bundle needs that check
-  updated to `{"self_lines", "class_lines", "instance_lines"}` (owned by the
-  inspector's workstream; a local 2-line copy passes with 0 errors).
+* **`inspect_maps.py` validates the 3-key split** (`self_lines`, `class_lines`,
+  `instance_lines`) since the usage-style map gained its third bucket; an older
+  2-key bundle would now report one `bad split` error per file entry.
 * **Plumbing artifacts under `/tmp` are disposable; only `maps/` is committed.**
   `maps/.gitkeep` is untouched. The plumbing runs above wrote to
   `/tmp/w1e-*`; `maps/` was not regenerated by this workstream (the full-suite

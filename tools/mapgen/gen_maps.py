@@ -165,6 +165,7 @@ def _merge_dynamic(target: dict, payload: dict, include_stats: bool) -> None:
         )
     for name, origin in (payload.get("names") or {}).items():
         target["names"].setdefault(name, origin)
+    target["coarse"].update(payload.get("bulk") or ())
     target["skipped"].update(payload.get("skipped") or ())
     if include_stats:
         # Per-process counters are not additive (workers may split the same
@@ -189,6 +190,7 @@ def load_dynamic(dynamic_path: str) -> tuple[dict, dict[str, int]]:
         "keys": {},
         "classes": {},
         "names": {},
+        "coarse": set(),
         "skipped": set(),
         "stats": {},
     }
@@ -221,6 +223,7 @@ def load_dynamic(dynamic_path: str) -> tuple[dict, dict[str, int]]:
             )
         )
     merged["skipped"] = sorted(merged["skipped"])
+    merged["coarse"] = sorted(merged["coarse"])
     merged["dialects"] = {
         bucket: sorted(names) for bucket, names in merged["dialects"].items()
     }
@@ -239,6 +242,7 @@ def load_dynamic(dynamic_path: str) -> tuple[dict, dict[str, int]]:
             ),
             "class_pairs": sum(len(names) for names in merged["classes"].values()),
             "dialect_buckets": len(merged["dialects"]),
+            "coarse_names": len(merged["coarse"]),
             "traces": stats["parents"] + stats["children"],
             "child_traces": stats["children"],
         }
@@ -1222,13 +1226,74 @@ def _ref_reason(ref, parents: dict, fields: dict) -> str | None:
     return f"{type(parent).__name__}.{field}"
 
 
-def _put(store: dict, key, reason: str | None) -> None:
-    """Keep the first opaque reason; "" marks "referenced and keyable only"."""
-    text = "" if reason is None else reason
-    if key not in store:
-        store[key] = text
-    elif store[key] == "" and text:
-        store[key] = text
+# --------------------------------------------------------------- ref classes
+# A reference is classified by what it can do to the container:
+#
+#   keyed     X[k] / X.get(k) / X.__contains__(k) / k in X -- the proxy logs the
+#             key, so per-key reads stay complete.
+#   presence  truthiness/len only (`if X:`, `bool(X or Y)`, `not X`) -- reads no
+#             key, only emptiness.
+#   alias     the object itself is handed on (`y = X`, `f(k=X)`, `return X`):
+#             same object, so keyed reads performed through the alias are still
+#             logged under NAME.  A copy/merge made *through* the alias is caught
+#             at run time by the proxies' coarse markers (trace_conftest.``_bulk``).
+#   hard      anything that consumes the entries wholesale or mutates them:
+#             iteration, .items()/.keys()/.values()/.copy(), `{**X}`, `dict(X)`,
+#             `X | Y`, `*X`, equality, f-strings, assignment to X[k], .pop/
+#             .update/.setdefault/..., calling X.  Those propagate entries into
+#             *another* container (whose reads are recorded under that other
+#             name) or scan them all, so per-key data cannot be trusted.
+_PRESENCE_REASONS = frozenset(
+    {"BoolOp.values", "If.test", "While.test", "IfExp.test", "Assert.test", "UnaryOp.operand"}
+)
+_ALIAS_REASONS = frozenset(
+    {
+        "Assign.value",
+        "AnnAssign.value",
+        "Return.value",
+        "Yield.value",
+        "Tuple.elts",
+        "List.elts",
+        "Expr.value",
+        "IfExp.body",
+        "IfExp.orelse",
+        "NamedExpr.value",
+        "Await.value",
+        "arguments.defaults",
+    }
+)
+_CONTAINER_CALLS = frozenset({"dict", "list", "set", "tuple", "frozenset"})
+
+
+def _reason_class(reason, node, parents: dict) -> str:
+    """``keyed`` / ``presence`` / ``alias`` / ``hard`` for one reference."""
+    if reason is None:
+        return "keyed"
+    if reason in _PRESENCE_REASONS:
+        return "presence"
+    if reason in _ALIAS_REASONS:
+        return "alias"
+    if reason == "Dict.values":
+        # ``{**X}`` merges (hard); ``{"k": X}`` merely stores the object.
+        parent = parents.get(node)
+        try:
+            return "hard" if any(key is None for key in parent.keys) else "alias"
+        except Exception:  # noqa: BLE001
+            return "hard"
+    if reason == "keyword.value":
+        # ``f(**X)`` unpacks (hard); ``f(k=X)`` hands the object over (alias).
+        parent = parents.get(node)
+        try:
+            return "hard" if getattr(parent, "arg", None) is None else "alias"
+        except Exception:  # noqa: BLE001
+            return "hard"
+    if reason == "Call.args":
+        parent = parents.get(node)
+        func = getattr(parent, "func", None)
+        if isinstance(func, ast.Name) and func.id in _CONTAINER_CALLS:
+            return "hard"  # dict(X), list(X), set(X), tuple(X), frozenset(X)
+        return "alias"
+    return "hard"
 
 
 def _name_bindings(tree: ast.AST) -> set:
@@ -1269,9 +1334,24 @@ def _name_bindings(tree: ast.AST) -> set:
 
 
 def _collect_refs(tree: ast.AST, name_store: dict, attr_store: dict, class_store: dict) -> None:
+    """Record every non-binding reference with its reason *class*.
+
+    Each store maps a key to ``{reason text: class}``.  The class of a reason is
+    the worst one seen for that reason text across the whole package (a shape can
+    be an alias in one place and a merge in another, e.g. ``Dict.values``).
+    """
     parents, fields = _parent_maps(tree)
     bindings = _name_bindings(tree)
     stack: list[str] = []
+
+    def record(store: dict, key, node) -> None:
+        reason = _ref_reason(node, parents, fields)
+        klass = _reason_class(reason, node, parents)
+        text = "" if reason is None else reason
+        entry = store.setdefault(key, {})
+        previous = entry.get(text)
+        if previous is None or _CLASS_RANK[klass] > _CLASS_RANK[previous]:
+            entry[text] = klass
 
     def visit(node) -> None:
         if isinstance(node, ast.ClassDef):
@@ -1284,17 +1364,19 @@ def _collect_refs(tree: ast.AST, name_store: dict, attr_store: dict, class_store
             return
         if isinstance(node, ast.Name):
             if node not in bindings:
-                reason = _ref_reason(node, parents, fields)
-                _put(name_store, node.id, reason)
+                record(name_store, node.id, node)
                 if stack:
-                    _put(class_store, (".".join(stack), node.id), reason)
+                    record(class_store, (".".join(stack), node.id), node)
         elif isinstance(node, ast.Attribute):
             if node not in bindings:
-                _put(attr_store, node.attr, _ref_reason(node, parents, fields))
+                record(attr_store, node.attr, node)
         for child in ast.iter_child_nodes(node):
             visit(child)
 
     visit(tree)
+
+
+_CLASS_RANK = {"keyed": 0, "presence": 1, "alias": 2, "hard": 3}
 
 
 def _is_container_expr(node) -> bool:
@@ -1347,33 +1429,102 @@ def _container_definitions(trees: dict[str, ast.AST]):
     return out
 
 
-def build_usage_kind(trees: dict[str, ast.AST]) -> tuple[dict, dict[str, int]]:
-    """maps/keyreads.json.gz usage_kind: NAME is ``keyable`` or ``opaque``."""
-    name_refs: dict[str, str] = {}
-    attr_refs: dict[str, str] = {}
-    class_refs: dict[tuple[str, str], str] = {}
+def _merge_reason_classes(stores) -> dict[str, str]:
+    """Union ``{reason: class}`` maps, keeping the hardest class per reason."""
+    merged: dict[str, str] = {}
+    for store in stores:
+        for reason, klass in store.items():
+            previous = merged.get(reason)
+            if previous is None or _CLASS_RANK[klass] > _CLASS_RANK[previous]:
+                merged[reason] = klass
+    return merged
+
+
+def build_usage_kind(
+    trees: dict[str, ast.AST], coarse_names=None
+) -> tuple[dict, dict[str, int]]:
+    """maps/keyreads.json.gz usage_kind: NAME is ``keyable`` or ``opaque``.
+
+    v3 (W1g) keeps the v1 static rule as its base -- a name is only trustworthy
+    when nothing consumes it wholesale -- but splits the "opaque" reasons by what
+    they can actually do, because the metaclass merges made the v1 answer too
+    pessimistic for the dialect tables:
+
+    * ``hard`` reasons (iteration, copy/merge/expand, ``X | Y``, equality,
+      mutation, f-string, calling X) still make the name ``opaque``, *wherever*
+      they occur.  They move entries into another container (reads of the copy
+      are recorded under the copy's NAME) or scan every entry, so per-key data
+      can never be complete.
+    * ``alias``/``presence`` reasons (``y = X``, ``f(k=X)``, ``if X:``) do not:
+      the object stays the same proxy, so keyed reads keep landing on NAME, and
+      a copy made *through* an alias is caught at run time by the proxies'
+      coarse markers (``trace_conftest._bulk`` -> ``coarse_names``).
+    * a name also needs at least one genuinely keyed reference: a table that is
+      only aliased or only truthiness-tested is not a lookup table and stays
+      ``opaque`` exactly as before.
+    * any name with a coarse runtime mark is demoted to ``opaque`` regardless.
+
+    ``coarse_names`` is the union of every process' ``_bulk`` (import time
+    included -- a copy made at import is precisely what static aliasing cannot
+    see through).
+    """
+    coarse = {str(name) for name in (coarse_names or ())}
+    name_refs: dict = {}
+    attr_refs: dict = {}
+    class_refs: dict = {}
     for tree in trees.values():
         _collect_refs(tree, name_refs, attr_refs, class_refs)
 
     table: dict[str, dict[str, str]] = {}
-    stats = {"keyable": 0, "opaque": 0, "reasons": {}}
+    stats = {
+        "keyable": 0,
+        "opaque": 0,
+        "reclassified": 0,
+        "coarse_blocked": 0,
+        "reasons": {},
+        "forgiven": {},
+        "reclassified_examples": [],
+    }
     reasons: dict[str, int] = {}
+    forgiven: dict[str, int] = {}
+    reclassified: list[str] = []
     for rel, full, bare, qualname in _container_definitions(trees):
-        candidates = [attr_refs.get(bare)]
+        candidates = [attr_refs.get(bare, {})]
         candidates.append(
-            name_refs.get(bare) if qualname is None else class_refs.get((qualname, bare))
+            name_refs.get(bare, {}) if qualname is None else class_refs.get((qualname, bare), {})
         )
-        used = any(reason is not None for reason in candidates)
-        opaque = next((reason for reason in candidates if reason), None)
-        if used and opaque is None:
-            kind = "keyable"
+        merged = _merge_reason_classes(candidates)
+        # The v1 verdict, kept for the "reclassified" count in MANIFEST.json.
+        old_kind = (
+            "keyable" if merged and all(klass == "keyed" for klass in merged.values()) else "opaque"
+        )
+        hard = sorted(reason for reason, klass in merged.items() if klass == "hard")
+        if not merged:
+            kind, reason = "opaque", "no-references"
+        elif hard:
+            kind, reason = "opaque", hard[0]
+        elif "keyed" not in merged.values():
+            kind, reason = "opaque", "no-keyed-reference"
+        elif full in coarse or bare in coarse:
+            kind, reason = "opaque", "coarse-runtime-read"
+            stats["coarse_blocked"] += 1
         else:
-            kind = "opaque"
-            reason = opaque or "no-references"
+            kind, reason = "keyable", ""
+        if kind == "opaque":
             reasons[reason] = reasons.get(reason, 0) + 1
+        else:
+            for text, klass in merged.items():
+                if klass != "keyed":
+                    forgiven[text] = forgiven.get(text, 0) + 1
+            if old_kind == "opaque":
+                stats["reclassified"] += 1
+                if len(reclassified) < 40:
+                    reclassified.append(f"{rel}:{full}")
         table.setdefault(rel, {})[full] = kind
         stats[kind] += 1
     stats["reasons"] = dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0])))
+    stats["forgiven"] = dict(sorted(forgiven.items(), key=lambda item: (-item[1], item[0])))
+    stats["reclassified_examples"] = reclassified
     return {rel: dict(sorted(names.items())) for rel, names in sorted(table.items())}, stats
 
 
@@ -1943,7 +2094,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    usage_kind, kind_stats = build_usage_kind(trees)
+    usage_kind, kind_stats = build_usage_kind(trees, dynamic.get("coarse") or ())
     module_paths = _module_table(sqlglot_files)
     keyreads, kr_stats = build_keyreads(
         dynamic, test_ids, usage_kind, dynamic.get("names") or {}, module_paths
@@ -1951,7 +2102,7 @@ def main(argv: list[str] | None = None) -> int:
     keyreads_size = _write_gz(os.path.join(out, "keyreads.json.gz"), _json_bytes(keyreads))
     log(
         "keyreads: tests={} pairs={} names={} keyable={} opaque={} "
-        "unclassified={} unplaced={}".format(
+        "unclassified={} unplaced={} reclassified={} coarse_blocked={}".format(
             kr_stats["tests"],
             kr_stats["pairs"],
             kr_stats["names"],
@@ -1959,6 +2110,8 @@ def main(argv: list[str] | None = None) -> int:
             kind_stats["opaque"],
             kr_stats["unclassified"],
             kr_stats["unplaced"],
+            kind_stats["reclassified"],
+            kind_stats["coarse_blocked"],
         )
     )
 
@@ -2028,6 +2181,21 @@ def main(argv: list[str] | None = None) -> int:
             "unplaced": kr_stats["unplaced"],
             "opaque_reasons": kind_stats["reasons"],
             "dynamic_stats": dynamic.get("stats") or {},
+            # v3 classification notes (W1g).  ``reclassified`` counts the names the
+            # v1 rule called opaque whose only non-keyed uses are aliasing/handoff/
+            # truthiness: the metaclass-created copies are proxied post-creation
+            # (see trace_conftest._repatch_class), so their keyed reads land on the
+            # same NAME.  ``coarse_blocked`` counts names demoted because a proxy
+            # saw its container consumed wholesale at run time (import included).
+            "classification": {
+                "rule": "v3: keyed+alias+presence => keyable; any hard use or a "
+                "coarse runtime read => opaque",
+                "reclassified": kind_stats["reclassified"],
+                "reclassified_examples": kind_stats["reclassified_examples"],
+                "coarse_blocked": kind_stats["coarse_blocked"],
+                "coarse_names": len(dynamic.get("coarse") or ()),
+                "forgiven_reasons": kind_stats["forgiven"],
+            },
         },
         "classes": {
             "touched_tests": class_stats["tests"],
@@ -2040,10 +2208,12 @@ def main(argv: list[str] | None = None) -> int:
             "unresolved_examples": hierarchy_stats["unresolved_examples"],
         },
         "capture": {
-            "version": 3,
+            "version": 4,
             "subprocess_trace": True,
             "class_trace": True,
             "usage_style": True,
+            "merged_class_reproxy": True,
+            "coarse_markers": True,
             "dynamic_parents": dynamic_stats["parents"],
             "dynamic_children": dynamic_stats["children"],
         },

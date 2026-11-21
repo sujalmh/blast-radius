@@ -43,10 +43,40 @@ session:
    patches ``sqlglot`` modules lazily as tests import them, which preserves
    import timing (and therefore the coverage map) exactly.
 
+   *Post-creation pass (W1g).*  ``_Dialect.__new__`` (the Dialect metaclass) and
+   ``_TokenizerBase.__init_subclass__`` build **new plain** containers while a
+   class is created -- merged copies (``UNESCAPED_SEQUENCES`` /
+   ``ESCAPED_SEQUENCES`` / ``TIME_TRIE`` / ``INVERSE_*``), rebuilt tokenizer
+   tables (``_QUOTES`` / ``_FORMAT_STRINGS`` / ``_KEYWORD_TRIE`` / ``_COMMENTS``)
+   and freshly ``type()``-created ``tokenizer_class`` / ``jsonpath_tokenizer_class``
+   / ``parser_class`` / ``generator_class`` objects.  ``_patch_module`` runs right
+   after a module executes, so it sees the merged *values*, but it only descends
+   into classes defined in that module; ``_repatch_class`` walks the class bodies
+   again (following role attributes across modules, id-guarded) so those copies
+   are proxied too.  It runs after every sqlglot module import -- including the
+   lazy dialect modules ``Dialect._try_load`` imports inside a test -- plus one
+   final sweep at collection end.  At the pin it proxies 496 further class
+   containers on 61 classes and leaves **zero** plain ``dict``/``list``/``set``/
+   ``tuple``/``frozenset`` attributes on any sqlglot class.
+
+   *Coarse markers.*  A proxy cannot attribute a wholesale consumption to a key,
+   so ``__iter__`` / ``keys`` / ``items`` / ``values`` / ``copy`` / ``update`` /
+   set algebra / ``__repr__`` / mutation record the *name* in ``_bulk`` instead.
+   Defining ``__iter__`` also makes ``{**X}`` and ``dict(X)`` go through
+   ``keys()`` + ``__getitem__`` (CPython's ``PyDict_Merge`` fast path only
+   applies to subtypes that keep the default iterator), so merges become visible
+   *and* marked.  ``gen_maps.py`` demotes every name in that set to ``opaque``.
+
+   Key reads raised while a sqlglot module is executing are routed to the sink
+   (``_PatchLoader.exec_module``), so a dialect imported lazily inside a test
+   never has its import-time merges attributed to that test.
+
    NAME is the bare module-level name, or ``Class.NAME`` for class bodies
    (``Qualname.NAME`` for nested classes, e.g. ``Dialect.Tokenizer.KEYWORDS``).
    ``gen_maps.py`` normalises the same way and only ever compares the emitted
-   form.
+   form.  ``BR_KEYREADS_NESTED=1`` additionally proxies sub-containers one level
+   deep for "dict of small tables" constants (recorded as ``NAME[key]``); it is
+   off by default because nothing can statically classify those names yet.
 
 5. Expression construction (``maps/classes.json.gz`` input, L4).  The base
    ``__init__`` that every ``sqlglot.expressions.Expression`` subclass runs
@@ -78,8 +108,9 @@ session:
 
 Safety: nothing here may change test behaviour, so the proxies are exact
 subclasses, copies/deepcopies degrade to plain containers (a copy is a
-protocol-level read a proxy cannot observe, so those names are classified
-``opaque`` statically anyway), and every hook swallows its own errors.
+protocol-level read a proxy cannot observe, which is why every name whose
+container is consumed wholesale is marked coarse and classified ``opaque``
+statically), and every hook swallows its own errors.
 
 Environment:
   BR_CHECKOUT       checkout root (default: cwd)
@@ -88,6 +119,7 @@ Environment:
   BR_COVERAGE_FILE  coverage data file (default: .coverage)
   BR_COVERAGE=0     disable the coverage driver (trace only)
   BR_KEYREADS=0     disable the constant-key proxies
+  BR_KEYREADS_NESTED=1  also proxy one level of sub-containers (off by default)
   BR_DIALECTS=0     disable the dialect-exposure trace
   BR_CLASSES=0      disable the expression-construction trace
   BR_KEYREADS_SCOPE all|core  which constants to proxy (default: all)
@@ -129,6 +161,13 @@ KEYREADS_ENABLED = os.environ.get("BR_KEYREADS", "1") != "0"
 DIALECTS_ENABLED = os.environ.get("BR_DIALECTS", "1") != "0"
 CLASSES_ENABLED = os.environ.get("BR_CLASSES", "1") != "0"
 KEYREADS_SCOPE = os.environ.get("BR_KEYREADS_SCOPE", "all")
+# One level of nested proxying for "dict of small tables" constants (see
+# ``_wrap``).  Off by default: nested proxies are recorded as ``NAME[key]``,
+# which has no static definition in ``sqlglot/`` (so ``usage_kind`` can never
+# call it ``keyable`` and the selector cannot narrow on it), and registering them
+# costs ~19 KB gzipped of ``maps/keyreads.json.gz`` on a one-test plumbing run.
+# The mechanism is implemented and validated: ``BR_KEYREADS_NESTED=1`` turns it on.
+KEYREADS_NESTED = os.environ.get("BR_KEYREADS_NESTED", "0") != "0"
 SUBPROCESS_TRACE = os.environ.get("BR_SUBPROCESS_TRACE", "1") != "0"
 # True only inside a spawned worker (the sitecustomize shim imports this module
 # there).  The parent sets the env var for its future children at import time.
@@ -174,6 +213,24 @@ def _add_text(name: str, key) -> None:
     except Exception:  # noqa: BLE001 - never break a test over tracing
         pass
 _CUR_DIA = None  # set: dialect names, or None outside a test
+
+# Coarse (bulk / protocol / mutation) accesses.  Any name listed here had its
+# entries consumed wholesale at least once -- iterated, copied, merged,
+# rendered, unioned or mutated -- so per-key read data for it can no longer be
+# complete (an iteration/copy also *moves* entries into another container whose
+# reads are recorded under that other name).  ``gen_maps.py`` demotes every such
+# name to ``opaque``: this is the runtime half of the safety classification.
+# It is global (import time included) on purpose: a copy made at import time is
+# exactly the propagation the static rules cannot see through an alias.
+_bulk: set[str] = set()
+
+
+def _mark_coarse(name: str) -> None:
+    try:
+        _bulk.add(name)
+    except Exception:  # noqa: BLE001 - never break a test over tracing
+        pass
+
 
 # Expression construction (L4).  ``_CUR_CLASSES`` is always a *set*: reads
 # outside a test land in the module-local sink and are dropped (import-time
@@ -465,6 +522,121 @@ _PROXY_CLASS = {
     frozenset: _ProxyFrozenSet,
 }
 
+
+def _install_coarse_tracking() -> None:
+    """Record wholesale consumption of a proxied container (see ``_bulk``).
+
+    Only the operations whose *reads* a proxy cannot attribute to a key are
+    wrapped: iteration, the three view methods, copies/merges, set algebra,
+    rendering and mutation.  ``__len__``/truthiness is deliberately left alone
+    (it reads no key, and it sits on the hottest path of all).
+    """
+
+    def install(proxy_class, base, names) -> None:
+        for name in names:
+            original = getattr(base, name, None)
+            if original is None:  # pragma: no cover - version dependent
+                continue
+
+            def make(original):
+                def method(self, *args, **kwargs):
+                    _mark_coarse(self._br_name)
+                    return original(self, *args, **kwargs)
+
+                return method
+
+            wrapper = make(original)
+            wrapper.__name__ = name
+            try:
+                setattr(proxy_class, name, wrapper)
+            except Exception:  # noqa: BLE001 - never break sqlglot
+                continue
+
+    dict_ops = (
+        "__iter__",
+        "keys",
+        "items",
+        "values",
+        "copy",
+        "update",
+        "setdefault",
+        "pop",
+        "popitem",
+        "__setitem__",
+        "__delitem__",
+        "__or__",
+        "__ror__",
+        "__ior__",
+        "__repr__",
+    )
+    list_ops = (
+        "__iter__",
+        "copy",
+        "__add__",
+        "__radd__",
+        "__iadd__",
+        "__mul__",
+        "__imul__",
+        "append",
+        "extend",
+        "insert",
+        "remove",
+        "pop",
+        "sort",
+        "reverse",
+        "__setitem__",
+        "__delitem__",
+        "__repr__",
+    )
+    tuple_ops = ("__iter__", "__add__", "__mul__", "__repr__")
+    set_ops = (
+        "__iter__",
+        "copy",
+        "union",  # also covers ``|`` for a ``set`` subclass instance
+        "intersection",
+        "difference",
+        "symmetric_difference",
+        "update",
+        "intersection_update",
+        "difference_update",
+        "symmetric_difference_update",
+        "add",
+        "discard",
+        "remove",
+        "pop",
+        "clear",
+        "__or__",
+        "__and__",
+        "__sub__",
+        "__xor__",
+        "__ior__",
+        "__iand__",
+        "__isub__",
+        "__ixor__",
+        "__repr__",
+    )
+    frozenset_ops = (
+        "__iter__",
+        "copy",
+        "union",
+        "intersection",
+        "difference",
+        "symmetric_difference",
+        "__or__",
+        "__and__",
+        "__sub__",
+        "__xor__",
+        "__repr__",
+    )
+    install(_ProxyDict, dict, dict_ops)
+    install(_ProxyList, list, list_ops)
+    install(_ProxyTuple, tuple, tuple_ops)
+    install(_ProxySet, set, set_ops)
+    install(_ProxyFrozenSet, frozenset, frozenset_ops)
+
+
+_install_coarse_tracking()
+
 # Attributes of classes/interfaces we must never proxy (Python/Enum internals).
 _SKIP_NAMES = frozenset({"__all__", "__builtins__", "__annotations__", "__dict__"})
 _SKIP_PREFIX = ("__",)
@@ -510,18 +682,68 @@ def _core_scope_ok(module_name: str, class_qualname: str | None, name: str) -> b
 def _is_container(value) -> bool:
     return type(value) in _PROXY_CLASS
 
+
+# Leaf types a nested (one level deep) proxied sub-container may hold.  The
+# brief for W1g is explicit: recurse only into "plain containers of
+# scalars/tuples", never into arbitrary object graphs.
+_SCALAR_LEAVES = (str, bytes, bytearray, int, float, complex, bool, type(None))
+
+
+def _is_scalar_leaf(value) -> bool:
+    if isinstance(value, _SCALAR_LEAVES):
+        return True
+    if type(value) in (tuple, frozenset):
+        return all(_is_scalar_leaf(item) for item in value)
+    return False
+
+
+def _is_scalar_container(value) -> bool:
+    """A plain container whose elements are scalars (or tuples of scalars)."""
+    kind = type(value)
+    if kind is dict:
+        return all(_is_scalar_leaf(key) for key in value.keys()) and all(
+            _is_scalar_leaf(item) for item in value.values()
+        )
+    if kind in (list, tuple):
+        return all(_is_scalar_leaf(item) for item in value)
+    if kind in (set, frozenset):
+        return all(_is_scalar_leaf(item) for item in value)
+    return False
+
+
 def _module_path(module_name: str) -> str:
     return module_name.replace(".", "/") + ".py"
+
 
 def _registered_name(name: str, module_name: str, class_qualname: str | None) -> str:
     return f"{class_qualname}.{name}" if class_qualname else name
 
-def _wrap(container, name: str):
-    """Return a logging proxy holding the same data as *container*."""
+
+def _wrap(container, name: str, origin: str | None = None, nested: bool = True):
+    """Return a logging proxy holding the same data as *container*.
+
+    ``nested`` additionally proxies sub-containers one level deep, but only for
+    a ``dict`` whose values are plain containers of scalars/tuples (the
+    "dict of small tables" shape, e.g. ``EXPRESSION_METADATA``).  The inner
+    proxies live inside the proxy, never in the original container, so the
+    copy is ours alone; they are recorded as ``NAME[key]``.
+    """
     proxy_class = _PROXY_CLASS[type(container)]
     proxy = proxy_class(container)
     proxy._br_name = name
+    if origin is not None:
+        _names.setdefault(name, origin)
+    if nested and KEYREADS_NESTED and type(container) is dict and container:
+        for key, value in list(dict.items(container)):
+            if not _is_scalar_container(value):
+                continue
+            inner_name = f"{name}[{_key_text(key)}]"
+            try:
+                dict.__setitem__(proxy, key, _wrap(value, inner_name, origin, nested=False))
+            except Exception:  # noqa: BLE001 - never break sqlglot
+                continue
     return proxy
+
 
 def _patch_scope(namespace, module_name: str, class_qualname: str | None, target) -> int:
     """Replace container values of *namespace* with logging proxies.
@@ -540,11 +762,14 @@ def _patch_scope(namespace, module_name: str, class_qualname: str | None, target
                 _skipped.add(f"{module_name}:{full} (scope)")
                 continue
             try:
-                setattr(target, name, _wrap(value, full))
+                setattr(
+                    target,
+                    name,
+                    _wrap(value, full, f"{module_name}:{class_qualname or '<module>'}"),
+                )
             except Exception as error:  # noqa: BLE001 - never break sqlglot
                 _skipped.add(f"{module_name}:{full} ({type(error).__name__}: {error})")
                 continue
-            _names.setdefault(full, f"{module_name}:{class_qualname or '<module>'}")
             count += 1
             continue
         if isinstance(value, type) and getattr(value, "__module__", None) == module_name:
@@ -572,7 +797,7 @@ def _patch_class(klass, module_name: str, depth: int = 0) -> int:
                 continue
             full = f"{qualname}.{name}"
             try:
-                setattr(klass, name, _wrap(value, full))
+                setattr(klass, name, _wrap(value, full, f"{module_name}:{qualname}"))
             except Exception as error:  # noqa: BLE001
                 _skipped.add(f"{module_name}:{full} ({type(error).__name__}: {error})")
                 continue
@@ -581,6 +806,107 @@ def _patch_class(klass, module_name: str, depth: int = 0) -> int:
         elif isinstance(value, type) and getattr(value, "__module__", None) == module_name:
             count += _patch_class(value, module_name, depth + 1)
     return count
+
+
+# ------------------------------------------------- post-creation re-proxying
+# ``_Dialect.__new__`` (the Dialect metaclass) and ``_TokenizerBase.
+# __init_subclass__`` build *new plain* class-body containers while a class is
+# being created: ``UNESCAPED_SEQUENCES``/``ESCAPED_SEQUENCES``/``TIME_TRIE``/…
+# are merged copies, ``_QUOTES``/``_KEYWORD_TRIE``/``_FORMAT_STRINGS``/… are
+# rebuilt for every subclass, and ``tokenizer_class``/``jsonpath_tokenizer_class``
+# /``parser_class``/``generator_class`` are freshly ``type()``-created classes.
+# ``_patch_module`` runs right after a module executes, so it sees the merged
+# *values* -- but it only descends into classes whose ``__module__`` is that
+# module, which misses the metaclass-built classes and anything a later
+# ``__init_subclass__`` rebound.  ``_repatch_class`` walks class bodies again
+# (and follows role attributes across modules), so those copies are proxied too.
+_PATCHED_CLASS_IDS: set[int] = set()
+_REPATCHED = {"classes": 0, "proxied": 0, "rounds": 0}
+
+
+def _class_origin(klass, fallback: str) -> str:
+    module = getattr(klass, "__module__", "") or ""
+    if module == "sqlglot" or module.startswith("sqlglot."):
+        return module
+    return fallback
+
+
+def _repatch_class(klass, module_name: str, depth: int = 0) -> int:
+    """(Re-)proxy the class-body containers of *klass* and its sub-classes."""
+    import enum as _enum
+
+    if depth > 4:
+        return 0
+    key = id(klass)
+    if key in _PATCHED_CLASS_IDS:
+        return 0
+    try:
+        if issubclass(klass, _enum.Enum):
+            return 0
+        namespace = list(vars(klass).items())
+    except Exception:  # noqa: BLE001 - never break sqlglot
+        return 0
+    _PATCHED_CLASS_IDS.add(key)
+    qualname = getattr(klass, "__qualname__", None) or getattr(klass, "__name__", "")
+    origin_module = _class_origin(klass, module_name)
+    count = 0
+    for name, value in namespace:
+        if not isinstance(name, str) or name in _SKIP_NAMES or name.startswith(_SKIP_PREFIX):
+            continue
+        if _is_container(value):
+            if KEYREADS_SCOPE == "core" and not _core_scope_ok(origin_module, qualname, name):
+                _skipped.add(f"{origin_module}:{qualname}.{name} (scope)")
+                continue
+            full = f"{qualname}.{name}"
+            try:
+                setattr(klass, name, _wrap(value, full, f"{origin_module}:{qualname}"))
+            except Exception as error:  # noqa: BLE001
+                _skipped.add(f"{origin_module}:{full} ({type(error).__name__}: {error})")
+                continue
+            count += 1
+            continue
+        if isinstance(value, type) and (
+            getattr(value, "__module__", "") == "sqlglot"
+            or str(getattr(value, "__module__", "")).startswith("sqlglot.")
+        ):
+            count += _repatch_class(value, module_name, depth + 1)
+    if count:
+        _REPATCHED["proxied"] += count
+        _REPATCHED["classes"] += 1
+    return count
+
+
+def _repatch_module(module, module_name: str) -> int:
+    """Re-proxy every sqlglot class reachable from *module*'s namespace."""
+    total = 0
+    try:
+        values = list(vars(module).values())
+    except Exception:  # noqa: BLE001
+        return 0
+    for value in values:
+        if isinstance(value, type) and (
+            getattr(value, "__module__", "") == "sqlglot"
+            or str(getattr(value, "__module__", "")).startswith("sqlglot.")
+        ):
+            total += _repatch_class(value, module_name)
+    if total:
+        _REPATCHED["rounds"] += 1
+    return total
+
+
+def _repatch_loaded() -> None:
+    """Final sweep: every sqlglot class in ``sys.modules`` (collection time)."""
+    for module_name, module in list(sys.modules.items()):
+        if not (module_name == "sqlglot" or module_name.startswith("sqlglot.")):
+            continue
+        if module is None or not hasattr(module, "__dict__"):
+            continue
+        if getattr(module, "__name__", "") != module_name:
+            continue
+        try:
+            _repatch_module(module, module_name)
+        except Exception as error:  # noqa: BLE001 - tracing must never break imports
+            _skipped.add(f"{module_name} (repatch: {type(error).__name__})")
 
 
 def _patch_module(module) -> None:
@@ -595,6 +921,14 @@ def _patch_module(module) -> None:
             _patch_scope(vars(module), name, None, module)
         except Exception as error:  # noqa: BLE001 - a broken proxy is worse than none
             _skipped.add(f"{name} (module patch: {type(error).__name__})")
+        # Post-creation pass (W1g): the metaclass/``__init_subclass__`` copies and
+        # the ``type()``-built tokenizer/parser/generator classes only become
+        # visible once the module has executed, and several of them live on
+        # classes whose ``__module__`` is a *different* module.
+        try:
+            _repatch_module(module, name)
+        except Exception as error:  # noqa: BLE001
+            _skipped.add(f"{name} (module repatch: {type(error).__name__})")
     if DIALECTS_ENABLED and name == "sqlglot.dialects.dialect":
         _install_dialect_hooks(module)
     if CLASSES_ENABLED and name in _EXPRESSION_MODULES:
@@ -612,8 +946,21 @@ class _PatchLoader(importlib.abc.Loader):
         return self._loader.create_module(spec)
 
     def exec_module(self, module):
-        self._loader.exec_module(module)
-        _patch_module(module)
+        # Module execution is import time even when it happens *inside* a test
+        # (dialects are imported lazily by ``Dialect._try_load``): the dialect
+        # class bodies run their metaclass merges there, and attributing those
+        # copies to whichever test triggered the import would both explode the
+        # key-read map and make it depend on test order/scheduling.  Route every
+        # key read raised while a sqlglot module executes into the sink, exactly
+        # like an import that happens before any test.
+        global _CUR_KEYS
+        saved = _CUR_KEYS
+        _CUR_KEYS = _SINK
+        try:
+            self._loader.exec_module(module)
+            _patch_module(module)
+        finally:
+            _CUR_KEYS = saved
 
     def __getattr__(self, name):
         return getattr(self._loader, name)
@@ -1043,6 +1390,13 @@ def pytest_collection_finish(session):
     _current_file = None
     if DIALECTS_ENABLED:
         _CUR_DIA = None
+    # Every sqlglot module is imported by now: one final (id-guarded) sweep so
+    # classes created after their module was patched still get proxied.
+    if KEYREADS_ENABLED:
+        try:
+            _repatch_loaded()
+        except Exception as error:  # noqa: BLE001 - tracing must never break the run
+            print(f"[trace_conftest] repatch sweep failed: {error}", file=sys.stderr)
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -1120,6 +1474,9 @@ def _dynamic_payload() -> dict:
         "keys": keys_payload,
         "classes": classes_payload,
         "names": _names,
+        # Names whose container was consumed wholesale (iteration/copy/merge/
+        # render/mutation) at least once: per-key data cannot be complete.
+        "bulk": sorted(_bulk),
         "skipped": sorted(_skipped),
         "stats": {
             "patched_modules": len(_patched_modules),
@@ -1130,6 +1487,9 @@ def _dynamic_payload() -> dict:
             "class_buckets": len(classes_payload),
             "class_pairs": sum(len(names) for names in classes_payload.values()),
             "sink_classes": len(_SINK_CLASSES),
+            "coarse_names": len(_bulk),
+            "repatched_classes": _REPATCHED["classes"],
+            "repatched_rounds": _REPATCHED["rounds"],
         },
         "child": CHILD_MODE,
     }
