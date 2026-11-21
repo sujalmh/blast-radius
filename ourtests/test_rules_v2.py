@@ -108,7 +108,9 @@ def test_partial_exposure_map_disables_narrowing(tmp_path):
     try:
         assert maps.tests_exposed_to("duck") is None
         _, numbers = _select("dialect-class-body", maps, index)
-        assert numbers == {0, 2, 3, 6}  # unrefined: nothing dropped
+        # Unrefined: nothing is dropped, and L4 degrades to the conservative
+        # union (K is unusable without a complete exposure map).
+        assert numbers == {0, 2, 3, 4, 6}
         assert any("subset" in warning for warning in maps.warnings)
     finally:
         maps.close()
@@ -147,10 +149,12 @@ def test_dialect_narrowing_never_drops_exposed_tests(loaded):
 def test_class_body_drops_all_file_expansion(loaded):
     maps, index = loaded
     selection, numbers = _select("dialect-class-body", maps, index, Knobs(dialect="off"))
-    assert numbers == {0, 2, 3, 6}
+    # Duck is a known dialect class: L4 = exposure(duck+gander) {0,3,4,6} union
+    # the span/read coverage {0,2,3,4,6}.  No all-file expansion (tests 1, 5).
+    assert numbers == {0, 2, 3, 4, 6}
     rules = {hit.rule for hit in selection.rules}
     assert "classbody_all" not in rules
-    assert "anchor" in rules and "usage" in rules
+    assert "classattr" in rules and "anchor" in rules
 
 
 def test_classbody_all_knob_restores_v1_expansion(loaded):

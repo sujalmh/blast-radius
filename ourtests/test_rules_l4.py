@@ -4,14 +4,17 @@ The scenario the rule exists for: a class-body assignment such as
 ``TriggerProperties.arg_types = {...}`` is read instance-style in the *base*
 class (``Expression.validate`` reads ``self.ARG_TYPES``), so the L1 usage rule
 selects every test that runs any expression at all.  L4 replaces L1 for that
-name with "tests that build the class or a descendant, plus the static reads of
-the name, plus the class's own symbol coverage".
+name with the class-family universe K, the static (``class_lines``) reads, and
+the class's own symbol coverage.
 
 Every map here is handcrafted (``ourtests/mockmaps.py``); fixture class bodies:
 
-    sqlglot/expr.py      Expression.ARG_TYPES (11-18 Trigger, 21-22 TriggerChild)
-    sqlglot/lonely.py    Lonely.TAG (TAG is absent from usage_style)
-    sqlglot/dialects/crane.py  Crane.SPANS (dialect-scoped)
+    sqlglot/expr.py       Expression.ARG_TYPES (11-18 Trigger, 21-22 TriggerChild)
+    sqlglot/lonely.py     Lonely.TAG (TAG absent from usage_style: K UNKNOWN)
+    sqlglot/dialects/crane.py   Crane.SPANS (dialect-scoped, class_scope)
+    sqlglot/dialects/beam.py    Beam.WEEK_OFFSET (the 535z shape: reads it
+                                through a *parameter* receiver only)
+    sqlglot/tokens.py     Tokenizer.NUMERIC_ESCAPES (the mirror: K UNKNOWN)
 """
 
 from __future__ import annotations
@@ -61,7 +64,11 @@ def test_l4_maps_are_gated_and_loaded(loaded):
     maps, _ = loaded
     assert maps.has_classes()
     assert maps.usage_style("ARG_TYPES") == {
-        "sqlglot/expr.py": {"self_lines": [7, 18], "other_lines": [26]}
+        "sqlglot/expr.py": {
+            "self_lines": [7, 18],
+            "class_lines": [26],
+            "instance_lines": [],
+        }
     }
     # A name the usage-style map does not know reads as "no static reads".
     assert maps.usage_style("TAG") == {}
@@ -191,6 +198,123 @@ def test_module_level_change_is_never_classattr(loaded):
     selection, numbers = _select("module-dict", maps, index)
     assert numbers == mockmaps.EXPECTATIONS["module-dict"] == {0, 3, 4}
     assert "classattr" not in _rules(selection)
+
+
+# -- class-family universe (3-way usage_style) ---------------------------
+
+
+def test_class_families_are_detected(loaded):
+    maps, _ = loaded
+    # Expression path: the construction trace captures instances.
+    assert maps.class_family("sqlglot/expr.py", "Trigger") == ("expression", None)
+    assert maps.class_family("sqlglot/expr.py", "TriggerChild") == ("expression", None)
+    # Dialect path: exact class_scope entry -> dialect key.
+    assert maps.class_family("sqlglot/dialects/beam.py", "Beam") == ("dialect", "beam")
+    assert maps.class_family("sqlglot/dialects/crane.py", "Crane") == (
+        "dialect",
+        "crane",
+    )
+    # Everything else: K is UNKNOWN.  (The mock's `touched` deliberately lists
+    # non-expression classes too -- a real trace only records Expr
+    # constructions -- so Lonely reads as expression through constructor
+    # evidence; Tokenizer is only in the hierarchy, which is the shape a real
+    # map has for a tokenizer body.)
+    assert maps.class_family("sqlglot/tokens.py", "Tokenizer") == ("unknown", None)
+    assert maps.class_family("sqlglot/lonely.py", "Lonely") == ("expression", None)
+
+
+def test_nested_class_in_a_dialect_file_is_not_a_dialect_family(loaded):
+    """4d63: ``class Tokenizer`` inside ``class Duck(Dialect)`` is not a dialect.
+
+    The *scope* walk (used for dialect narrowing) deliberately climbs outer
+    classes, but the family test must not: a tokenizer class body's instance
+    universe is not the dialect exposure map.
+    """
+    maps, _ = loaded
+    assert maps.dialect_class_scope("sqlglot/dialects/beam.py", "Beam.Tokens") == "beam"
+    assert maps.class_family("sqlglot/dialects/beam.py", "Beam.Tokens") == (
+        "unknown",
+        None,
+    )
+
+
+def test_dialect_family_keeps_a_parameter_receiver_reader(loaded):
+    """535z soundness: the failing test reads WEEK_OFFSET via a param receiver.
+
+    ``dialect.WEEK_OFFSET`` in optimizer/simplify.py is an ``instance_lines``
+    read, so L4 must *not* rely on it -- the dialect-path universe K (tests
+    exposed to ``beam``) is what keeps test_extra (4) selected, while test_delta
+    (5), which covers the very same line but is not beam-exposed, is dropped.
+    """
+    maps, index = loaded
+    attr_ids = maps.classattr_tests("sqlglot/dialects/beam.py", "Beam", "WEEK_OFFSET")
+    assert attr_ids is not None
+    assert "tests/test_other.py::test_extra" in attr_ids  # only via exposure
+    assert "tests/test_mod.py::test_delta" not in attr_ids
+    assert "beam" in mockmaps.DIALECTS["exposure"]["tests/test_other.py::test_extra"]
+    assert "beam" not in mockmaps.DIALECTS["exposure"]["tests/test_mod.py::test_delta"]
+
+    selection, numbers = _select("l4-dialect-param", maps, index)
+    assert numbers == mockmaps.EXPECTATIONS["l4-dialect-param"] == {4}
+    assert "classattr" in _rules(selection)
+    assert any("dialect:beam" in hit.detail for hit in selection.rules)
+
+    # Dialect narrowing off isolates the rule: K + Beam's span {0} survive,
+    # the instance-only reader (5) does not.
+    _, unnarrowed = _select("l4-dialect-param", maps, index, Knobs(dialect="off"))
+    assert unnarrowed == {0, 4}
+    # Without L4 the usage rule keeps both parameter readers.
+    _, plain = _select(
+        "l4-dialect-param", maps, index, Knobs(l4="off", dialect="off")
+    )
+    assert plain == {0, 4, 5}
+
+
+def test_unknown_family_keeps_instance_line_readers(loaded):
+    """Mirror of 535z: Tokenizer bodies are not traced, so instance reads stay.
+
+    The same ``tokenizer.NUMERIC_ESCAPES`` parameter read that L4 drops for a
+    dialect class must keep its test here.
+    """
+    maps, index = loaded
+    attr_ids = maps.classattr_tests("sqlglot/tokens.py", "Tokenizer", "NUMERIC_ESCAPES")
+    assert attr_ids is not None
+    assert "tests/test_mod.py::test_delta" in attr_ids  # instance_lines reader
+    selection, numbers = _select("l4-tokenizer-instance", maps, index)
+    assert numbers == mockmaps.EXPECTATIONS["l4-tokenizer-instance"] == {3, 5}
+    assert "classattr" in _rules(selection)
+    assert any("unknown" in hit.detail for hit in selection.rules)
+    # The same read *is* dropped for the dialect family above (see
+    # test_dialect_family_keeps_a_parameter_receiver_reader): the split really
+    # is receiver-kind + family driven.
+    assert 5 in numbers
+
+
+def test_legacy_two_way_usage_style_stays_conservative(tmp_path):
+    """A pre-W1f map (``other_lines``) keeps every instance read in the union."""
+    maps_dir = mockmaps.build_maps(tmp_path / "maps")
+    legacy = {}
+    for name, files in mockmaps.USAGE_STYLE.items():
+        legacy[name] = {
+            file: {
+                "self_lines": detail["self_lines"],
+                "other_lines": detail["class_lines"] + detail["instance_lines"],
+            }
+            for file, detail in files.items()
+        }
+    _write_gz_json(maps_dir / "usage_style.json.gz", legacy)
+    maps = Maps.load(maps_dir)
+    index = _index(maps)
+    try:
+        assert maps.has_classes()
+        # class_lines falls back to other_lines, which contains the instance
+        # read: both parameter readers stay.
+        _, beam = _select("l4-dialect-param", maps, index, Knobs(dialect="off"))
+        assert beam == {0, 4, 5}
+        _, tokenizer = _select("l4-tokenizer-instance", maps, index)
+        assert tokenizer == {3, 5}
+    finally:
+        maps.close()
 
 
 # -- degraded behaviour --------------------------------------------------

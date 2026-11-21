@@ -18,10 +18,29 @@ large one (``keyreads``) is only opened when a rule actually asks for it.
 
 The L4 maps (``classes.json.gz``: per-test instantiated expression classes plus
 the class hierarchy; ``usage_style.json.gz``: per-name reference lines split
-into ``self``/``cls``-style reads and everything else) are optional in exactly
-the same way: when either file is missing, unreadable, or the construction trace
-covers less than 90% of the committed test index, L4 is disabled with a warning
-and the L1 rule is used unchanged.
+into ``self_lines`` / ``class_lines`` / ``instance_lines`` by receiver kind) are
+optional in exactly the same way: when either file is missing, unreadable, or
+the construction trace covers less than 90% of the committed test index, L4 is
+disabled with a warning and the L1 rule is used unchanged.
+
+The 3-way split is what makes L4 *sound* rather than merely narrow.  A name's
+reads are split by receiver: ``self_lines`` run on ``self``/``cls``, i.e. inside
+a method of the owning class (already covered by that class's symbol spans),
+``class_lines`` resolve statically to a class/module, and ``instance_lines``
+read through a plain variable or parameter.  Instance reads can only be dropped
+for a class family whose *instance universe* is captured by a trace:
+
+* expression classes -- ``classes.json.gz`` records every ``Expr`` construction,
+  so "some test built this class or a descendant" is the universe;
+* dialect classes -- ``dialects.json.gz`` records which dialects each test
+  resolves, so "this test ran under the class's dialect or a derived one" is
+  the universe (a ``dialect.WEEK_OFFSET`` read implies a dialect was resolved,
+  but not *which* one -- that is exactly what exposure answers).
+
+For every other family (``Tokenizer``/``Parser``/``Generator`` class bodies,
+plain helpers) instance creation is not traced, so ``self_lines`` and
+``instance_lines`` stay in the union: dropping them there would silently lose
+tests.
 """
 
 from __future__ import annotations
@@ -48,6 +67,14 @@ BLOCK_LINES = 4
 # covers at least this share of the committed test index.
 CLASS_MAP_FILES = ("classes.json.gz", "usage_style.json.gz")
 CLASS_COVERAGE_SHARE = 9  # per-mille-free form: touched * 10 >= index * 9
+
+# Class families whose instance universe a trace captures, so L4 may ignore
+# ``instance_lines`` for them.
+#   * expression classes: root names of the expression hierarchy (the
+#     construction trace in classes.json.gz wraps Expr.__init__);
+#   * dialect classes: the root dialect base class (dialects.json.gz exposure).
+EXPRESSION_ROOTS = frozenset({"Expr", "Expression"})
+DIALECT_ROOT = "Dialect"
 
 _COVERAGE_MAGIC = b"BRcov1"
 _U16 = struct.Struct(">H")
@@ -124,6 +151,31 @@ def _query_ranges(queries: Iterable[int | tuple[int, int]]):
         else:
             start, end = query
             yield int(start), int(end)
+
+
+def _bare_name(node: str) -> str:
+    """Last dotted component of a class node (``a.b.C`` -> ``C``)."""
+    return node.rpartition(".")[2]
+
+
+def _style_lines(detail: dict, bucket: str, legacy: str | None = None) -> list[int]:
+    """Sorted-ish reference lines of one ``usage_style`` bucket.
+
+    ``legacy`` is the pre-W1f bucket name to fall back to when ``bucket`` is
+    absent (``other_lines`` == ``class_lines | instance_lines``).
+    """
+    lines = detail.get(bucket)
+    if not isinstance(lines, list) and legacy is not None:
+        lines = detail.get(legacy)
+    if not isinstance(lines, list):
+        return []
+    result: list[int] = []
+    for line in lines:
+        try:
+            result.append(int(line))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 class _Coverage:
@@ -701,7 +753,7 @@ class Maps:
         return self._classes_raw
 
     def _usage_style(self) -> dict:
-        """``usage_style.json.gz`` (L4): name -> file -> self/other reference lines."""
+        """``usage_style.json.gz`` (L4): name -> file -> receiver-split lines."""
         if self._usage_style_raw is None:
             self._usage_style_raw = self._optional_json(
                 "usage_style.json.gz", quiet=True
@@ -1104,7 +1156,14 @@ class Maps:
         return self._class_graph_cache
 
     def usage_style(self, name: str) -> dict:
-        """``{file: {"self_lines": [...], "other_lines": [...]}}`` for ``name``."""
+        """``{file: {"self_lines": [...], "class_lines": [...], "instance_lines": [...]}}``.
+
+        The 3-way split is the W1f format.  The predecessor shipped a 2-way
+        split (``self_lines`` / ``other_lines``), where ``other_lines`` is
+        exactly ``class_lines | instance_lines``; reading it as the
+        ``class_lines`` bucket keeps that degraded map recall-safe (the
+        conservative union then still contains every instance read).
+        """
         entry = self._usage_style().get(name)
         if not isinstance(entry, dict):
             return {}
@@ -1119,39 +1178,135 @@ class Maps:
         count = len(ids)
         return {ids[ordinal] for ordinal in ordinals if 0 <= ordinal < count}
 
+    # -- class families (L4 universe) ------------------------------------
+
+    def _dialect_class_key(self, file: str, qualname: str) -> str | None:
+        """Dialect key of the *class itself* (``None`` for nested non-dialects).
+
+        Deliberately exact: unlike :meth:`dialect_class_scope` this does not walk
+        outer classes, because a nested ``class Tokenizer`` inside
+        ``class Snowflake(Dialect)`` is a tokenizer body (its own instance
+        universe), not a dialect class body.
+        """
+        scope = self._dialects().get("class_scope")
+        if not isinstance(scope, dict):
+            return None
+        classes = scope.get(file)
+        if not isinstance(classes, dict):
+            return None
+        value = classes.get(qualname)
+        return str(value) if isinstance(value, str) else None
+
+    @staticmethod
+    def _class_nodes(graph: "_ClassGraph", file: str, qualname: str) -> list[str]:
+        """Canonical graph nodes for ``qualname`` defined in ``file``."""
+        nodes: list[str] = []
+        for spelling in _class_spellings(file, qualname):
+            node = graph.resolve(spelling)
+            if node is not None and node not in nodes:
+                nodes.append(node)
+        return nodes
+
+    def _class_family(
+        self, graph: "_ClassGraph | None", file: str, qualname: str
+    ) -> tuple[str, str | None]:
+        """``("expression"|"dialect"|"unknown", dialect key or None)``.
+
+        ``expression``: the class or an ancestor is ``Expr``/``Expression`` (the
+        construction trace captures its instances), or the trace built the class
+        at least once; ``dialect``: the class is a dialect class (exact
+        ``class_scope`` entry, or a ``Dialect`` ancestor per the hierarchy); the
+        second element is its dialect key when one is known.  ``unknown``:
+        instance creation is not traced.
+        """
+        nodes = self._class_nodes(graph, file, qualname) if graph is not None else []
+        if graph is not None:
+            for node in nodes:
+                if any(
+                    _bare_name(ancestor) in EXPRESSION_ROOTS
+                    for ancestor in graph.ancestry(node)
+                ):
+                    return "expression", None
+        key = self._dialect_class_key(file, qualname)
+        if key is not None:
+            return "dialect", key
+        if graph is not None:
+            # ``classes.json.gz`` only records ``Expr`` constructions, so a class
+            # it saw being built *is* an expression class even when the
+            # hierarchy entry is missing (a degraded, constructor-only map).
+            if any(node in graph.touched for node in nodes):
+                return "expression", None
+            for node in nodes:
+                if any(
+                    _bare_name(ancestor) == DIALECT_ROOT
+                    for ancestor in graph.ancestry(node)
+                ):
+                    # A dialect base class: instances resolve to some derived
+                    # dialect key, which the exposure map owns.
+                    return "dialect", self.dialect_file_scope(file)
+        return "unknown", None
+
+    def class_family(self, file: str, qualname: str) -> tuple[str, str | None]:
+        """Public form of :meth:`_class_family` (``unknown`` without class maps)."""
+        return self._class_family(self._class_graph(), file, qualname)
+
     def classattr_tests(self, file: str, qualname: str, name: str) -> set[str] | None:
         """L4: test ids that can observe ``qualname.name`` being changed in ``file``.
 
         ``None`` means "unresolvable": the class is absent from
-        ``classes.json.gz`` (or from the symbol table), so the caller must keep
-        the L1 usage rule for that name.
+        ``classes.json.gz`` (or from the symbol table) and is not a known
+        dialect class, so the caller must keep the L1 usage rule for that name.
 
-        The set is
-          * tests constructing the class or any descendant (recorded trace),
-          * tests covering a *non*-instance reference line of ``name``
-            (``dialect.WEEK_OFFSET``-style qualified reads), and
+        The set is the class-family *universe* K, unioned with
+          * tests covering a ``class_lines`` reference of ``name`` (statically
+            resolved receivers: ``TSQL.WEEK_OFFSET``, bare module reads), and
           * tests covering any symbol span of the class or a descendant
-            (a method body may read the attribute without the test ever
-            constructing the class directly).
-        ``self``/``cls``-style reads contribute nothing: they only execute on
-        instances of the class or a descendant, which the first term already
-        covers.
+            (a method body may read the attribute without the test constructing
+            the class directly).
+
+        K depends on the family (see :meth:`_class_family`):
+          * expression -- tests constructing the class or a descendant;
+          * dialect -- tests whose exposure includes the class's dialect key or a
+            derived dialect, plus the constructors/spans we happen to know;
+          * unknown (or a dialect class without a usable exposure universe) --
+            no universe; ``instance_lines`` *and* ``self_lines`` stay in the
+            union (instance creation is not traced for Tokenizer/Parser/Generator
+            bodies, and a descendant we cannot see may read the attribute on
+            ``self``), so nothing is lost.
+
+        When the universe *is* captured, ``self``/``cls``-style reads need no
+        separate term: a ``self.NAME`` read runs inside a method of the class or
+        a descendant, i.e. inside a symbol span (expression tree) or a test that
+        is exposed to the dialect (all derived dialects are in the family).
         """
         graph = self._class_graph()
         if graph is None:
             return None
-        targets: list[str] = []
-        for spelling in _class_spellings(file, qualname):
-            node = graph.resolve(spelling)
-            if node is not None and graph.mentioned(node) and node not in targets:
-                targets.append(node)
+        targets = self._class_nodes(graph, file, qualname)
         if not targets:
+            return None
+        family, dialect_key = self._class_family(graph, file, qualname)
+        if family != "dialect" and not any(graph.mentioned(node) for node in targets):
+            # The class sits in the symbol table but the construction trace and
+            # hierarchy never mention it: we cannot reason about its
+            # descendants, so keep L1.
             return None
         descendants = graph.descendants(targets)
 
         ids: set[str] = set()
         for node in descendants:
             ids.update(graph.touched.get(node, ()))
+
+        universe_captured = family == "expression"
+        if family == "dialect":
+            allowed = (
+                self.tests_exposed_to_family(dialect_key)
+                if dialect_key is not None
+                else None
+            )
+            if allowed is not None:
+                ids.update(allowed)
+                universe_captured = True
 
         spans: dict[str, list[tuple[int, int]]] = {}
         for node in descendants:
@@ -1162,14 +1317,21 @@ class Maps:
             ids.update(self._ids_for_ordinals(self.covering_tests(span_file, ranges)))
 
         for style_file, detail in self.usage_style(name).items():
-            lines = detail.get("other_lines")
-            if not isinstance(lines, list) or not lines:
-                continue
-            ids.update(
-                self._ids_for_ordinals(
-                    self.covering_tests(style_file, [int(line) for line in lines])
+            lines = _style_lines(detail, "class_lines", "other_lines")
+            if lines:
+                ids.update(
+                    self._ids_for_ordinals(self.covering_tests(style_file, lines))
                 )
-            )
+            if universe_captured:
+                continue
+            # No universe: every receiver kind is evidence that a test touches
+            # this attribute, so keep all of it in the union.
+            for bucket in ("instance_lines", "self_lines"):
+                extra = _style_lines(detail, bucket)
+                if extra:
+                    ids.update(
+                        self._ids_for_ordinals(self.covering_tests(style_file, extra))
+                    )
         return ids or None
 
     # -- pinned source: imports and literal entries ----------------------

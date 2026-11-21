@@ -14,11 +14,13 @@ every one of them is skipped when its map file is absent, which degrades to the
 unrefined, recall-safe selection instead of failing.
 
 L4 (class-attribute narrowing) refines a *class-body assignment* of ``NAME``
-inside class ``C``: for that name, the L1 usage set is replaced by tests that
-construct ``C`` or a descendant, tests covering a non-``self``/``cls`` reference
-of ``NAME``, and tests covering a symbol span of ``C`` or a descendant.
-Instance-style reads add nothing (they only run on instances the first term
-already covers).  Unresolvable classes keep L1; a missing/partial
+inside class ``C``: for that name, the L1 usage set is replaced by the
+class-family universe K, tests covering a ``class_lines`` reference of ``NAME``,
+and tests covering a symbol span of ``C`` or a descendant.  K is the expression
+construction trace for expression classes, the dialect-exposure family for
+dialect classes, and UNKNOWN otherwise -- in which case ``self_lines`` and
+``instance_lines`` stay in the union (Tokenizer/Parser/Generator instance
+creation is not traced).  Unresolvable classes keep L1; a missing/partial
 ``classes.json.gz`` disables the rule with a warning.
 """
 
@@ -382,23 +384,30 @@ def _classattr_ids(
     path: str,
     name: str,
     lines: Iterable[int],
-) -> set[str] | None:
+) -> tuple[set[str], str] | None:
     """L4: sound narrowing for a class-body attribute assignment of ``name``.
 
-    Returns the replacement for L1 for that single name, or ``None`` when the
-    change cannot be attributed to a resolvable class (module-level line, a
-    class the maps do not know): the caller then keeps L1 unchanged.
+    Returns ``(ids, family label)`` -- the replacement for L1 for that single
+    name -- or ``None`` when the change cannot be attributed to a resolvable
+    class (module-level line, a class the maps do not know, a dialect class
+    with no usable exposure): the caller then keeps L1 unchanged.
     """
     combined: set[str] | None = None
+    labels: set[str] = set()
     for line in sorted(lines):
         classes = _enclosing_classes(symbols, line)
         if not classes:
             return None  # module-level: not a class attribute
-        ids = maps.classattr_tests(path, classes[0].qualname, name)
+        qualname = classes[0].qualname
+        ids = maps.classattr_tests(path, qualname, name)
         if ids is None:
             return None
+        family, key = maps.class_family(path, qualname)
+        labels.add(f"{family}:{key}" if key else family)
         combined = ids if combined is None else combined | ids
-    return combined or None
+    if not combined:
+        return None
+    return combined, "+".join(sorted(labels))
 
 
 def _apply_sqlglot(
@@ -542,7 +551,7 @@ def _apply_sqlglot(
             if chosen is not None:
                 collapses[name] = chosen
 
-        classattr: dict[str, set[str]] = {}
+        classattr: dict[str, tuple[set[str], str]] = {}
         if (
             knobs.l4 == "on"
             and any(_enclosing_classes(symbols, line) for line in broad_lines)
@@ -551,14 +560,14 @@ def _apply_sqlglot(
             for name in sorted(assigned):
                 if name in collapses:
                     continue
-                ids = _classattr_ids(maps, symbols, path, name, assigned[name])
-                if ids is not None:
-                    classattr[name] = ids
+                result = _classattr_ids(maps, symbols, path, name, assigned[name])
+                if result is not None:
+                    classattr[name] = result
 
         for name, ids in collapses.items():
             parts.append(("keyread", f"{name}: {len(ids)} readers", ids))
-        for name, ids in classattr.items():
-            parts.append(("classattr", f"{name}: {len(ids)} tests", ids))
+        for name, (ids, family) in classattr.items():
+            parts.append(("classattr", f"{name}: {len(ids)} tests [{family}]", ids))
 
         remaining = [
             name for name in sorted(assigned) if name not in collapses and name not in classattr

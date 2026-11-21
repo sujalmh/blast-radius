@@ -2,7 +2,7 @@
 
     python3 -m ourtests.l4_probe
 
-``maps/`` ships without ``classes.json.gz`` / ``usage_style.json.gz`` until W1e
+``maps/`` ships without ``classes.json.gz`` / ``usage_style.json.gz`` until W1f
 lands them, so this probe fabricates stand-in maps **in a temp directory**
 (``maps/`` is never written) and reports the selection for the class-body
 sample commits:
@@ -10,8 +10,11 @@ sample commits:
   * ``touched``   -- per test, the classes whose symbol span the test covers
                      (a static stand-in for "the test constructs the class"),
   * ``hierarchy`` -- static base classes from the pinned tarball,
-  * ``usage_style`` -- reference lines of the probed names, split into
-                     ``self``/``cls`` reads and everything else.
+  * ``usage_style`` -- reference lines of the probed names split 3-ways by
+                     receiver kind, exactly as W1f's map does:
+                     ``self_lines`` (``self``/``cls``), ``class_lines`` (module
+                     or class receiver, or a bare module-scope read),
+                     ``instance_lines`` (plain variables/parameters).
 
 It is a measurement of the rule's shape, not a map generator: the real traces
 are strictly better (a test can construct a class without covering its span).
@@ -91,31 +94,101 @@ def _hierarchy(texts: dict[str, str], symbols: dict) -> dict[str, list[str]]:
     return edges
 
 
+def _static_receivers(tree: ast.AST) -> set[str]:
+    """Names that statically resolve to a module or a class in this file.
+
+    A receiver in this set is a ``class_lines`` read; anything else (a function
+    parameter, a local) is an ``instance_lines`` read.
+    """
+    names: set[str] = set()
+
+    def add_targets(node: ast.AST) -> None:
+        targets = getattr(node, "targets", None)
+        if targets is None:
+            target = getattr(node, "target", None)
+            targets = [target] if target is not None else []
+        stack = list(targets)
+        while stack:
+            current = stack.pop()
+            if isinstance(current, ast.Name):
+                names.add(current.id)
+            elif isinstance(current, (ast.Tuple, ast.List)):
+                stack.extend(current.elts)
+            elif isinstance(current, ast.Starred):
+                stack.append(current.value)
+
+    def visit(body) -> None:
+        for statement in body:
+            if isinstance(statement, (ast.Assign, ast.AugAssign)):
+                add_targets(statement)
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                add_targets(statement)
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(statement.name)  # a function object is a module binding
+            elif isinstance(statement, ast.ClassDef):
+                names.add(statement.name)
+            elif isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    if alias.name != "*":
+                        names.add(alias.asname or alias.name)
+            nested = getattr(statement, "body", None)
+            if isinstance(nested, list):
+                visit(nested)
+            for handler in getattr(statement, "handlers", ()) or ():
+                visit(handler.body)
+            for field in ("orelse", "finalbody"):
+                child = getattr(statement, field, None)
+                if isinstance(child, list):
+                    visit(child)
+
+    visit(getattr(tree, "body", []))
+    return names
+
+
 def _usage_style(texts: dict[str, str], names: tuple[str, ...]) -> dict:
-    style: dict[str, dict[str, dict[str, list[int]]]] = {name: {} for name in names}
+    """3-way receiver-split reference lines of ``names`` (W1f shape)."""
+    style: dict[str, dict[str, dict[str, list[int]]]] = {
+        name: {} for name in names
+    }
     for file, text in texts.items():
         try:
             tree = ast.parse(text)
         except SyntaxError:
             continue
+        static = _static_receivers(tree)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute) or node.attr not in style:
-                continue
-            entry = style[node.attr].setdefault(
-                file, {"self_lines": [], "other_lines": []}
-            )
-            if isinstance(node.value, ast.Name) and node.value.id in SELF_NAMES:
-                entry["self_lines"].append(node.lineno)
-            else:
-                entry["other_lines"].append(node.lineno)
-            if isinstance(node.value, ast.Name) and node.value.id in style:
-                style[node.value.id].setdefault(
-                    file, {"self_lines": [], "other_lines": []
-                })["other_lines"].append(node.lineno)
+            if isinstance(node, ast.Attribute) and node.attr in style:
+                bucket_names = [node.attr]
+                receiver = node.value
+                if isinstance(receiver, ast.Name):
+                    if receiver.id in SELF_NAMES:
+                        bucket = "self_lines"
+                    elif receiver.id in static:
+                        bucket = "class_lines"
+                    else:
+                        bucket = "instance_lines"
+                else:
+                    bucket = "instance_lines"
+                for name in bucket_names:
+                    entry = style[name].setdefault(
+                        file,
+                        {"self_lines": [], "class_lines": [], "instance_lines": []},
+                    )
+                    entry[bucket].append(node.lineno)
+            elif isinstance(node, ast.Name) and node.id in style:
+                if not isinstance(node.ctx, ast.Load):
+                    continue
+                entry = style[node.id].setdefault(
+                    file, {"self_lines": [], "class_lines": [], "instance_lines": []}
+                )
+                entry["class_lines"].append(node.lineno)
     for name, files in style.items():
         for entry in files.values():
-            entry["self_lines"] = sorted(set(entry["self_lines"]))
-            entry["other_lines"] = sorted(set(entry["other_lines"]))
+            for bucket in ("self_lines", "class_lines", "instance_lines"):
+                entry[bucket] = sorted(set(entry[bucket]))
     return style
 
 
@@ -135,8 +208,47 @@ def _touched(maps: Maps, symbols: dict, ids: list[str]) -> dict[str, list[str]]:
     return touched
 
 
+def expression_hierarchy(hierarchy: dict, symbols: dict) -> dict:
+    """Keep only the expression tree (what ``classes.json.gz`` actually traces).
+
+    The real trace wraps ``Expr.__init__``, so dialect/parser/tokenizer classes
+    are never in ``touched`` or ``hierarchy`` -- and L4 then keeps L1 for them.
+    Restricting the stand-in to the same tree keeps the diagnostic faithful
+    (the UNKNOWN-family behaviour is covered by the ``mockmaps`` unit tests).
+    """
+    keep: set[str] = set()
+    for file, entries in symbols.items():
+        if not file.startswith("sqlglot/expressions"):
+            continue
+        modules = _class_module_names(file)
+        if not modules:
+            continue
+        for qualname, _start, _end, kind in entries:
+            if kind == "class":
+                keep.add(f"{modules[0]}.{qualname}")
+    return {
+        node: [base for base in bases if base in keep]
+        for node, bases in hierarchy.items()
+        if node in keep
+    }
+
+
+def expression_touched(maps: Maps, symbols: dict, ids: list[str]) -> dict:
+    """Stand-in ``touched``: expression classes only (span coverers)."""
+    touched = _touched(
+        maps,
+        {
+            file: entries
+            for file, entries in symbols.items()
+            if file.startswith("sqlglot/expressions")
+        },
+        ids,
+    )
+    return touched
+
+
 def main() -> int:
-    maps_dir = ROOT / "maps"
+    maps_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "maps"
     temp = Path(tempfile.mkdtemp(prefix="blastradius-l4-"))
     staged = temp / "maps"
     shutil.copytree(maps_dir, staged)
@@ -154,21 +266,27 @@ def main() -> int:
     try:
         texts = _sources(staged)
         symbols = json.loads(gzip.decompress((staged / "symbols.json.gz").read_bytes()))
-        touched = _touched(maps, symbols, ids)
+        touched = expression_touched(maps, symbols, ids)
         document = {
             "touched": touched,
-            "hierarchy": _hierarchy(texts, symbols),
+            "hierarchy": expression_hierarchy(_hierarchy(texts, symbols), symbols),
         }
         (staged / "classes.json.gz").write_bytes(
             gzip.compress(json.dumps(document).encode("utf-8"), mtime=0)
         )
         (staged / "usage_style.json.gz").write_bytes(
-            gzip.compress(json.dumps(_usage_style(texts, NAMES)).encode("utf-8"), mtime=0)
+            gzip.compress(
+                json.dumps(_usage_style(texts, NAMES)).encode("utf-8"), mtime=0
+            )
         )
     finally:
         maps.close()
 
-    for label, knobs in (("L4 on", None), ("L4 off", selection.Knobs(l4="off"))):
+    for label, knobs in (
+        ("L4 on", None),
+        ("L4 on, dialect narrow off", selection.Knobs(dialect="off")),
+        ("L4 off", selection.Knobs(l4="off")),
+    ):
         fresh = Maps.load(staged)
         index = selection.TestIndex(fresh.test_ids(), {t: i for i, t in enumerate(ids)})
         try:

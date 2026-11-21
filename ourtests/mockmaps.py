@@ -23,13 +23,16 @@ SOURCE_FILES = (
     "sqlglot/__init__.py",
     "sqlglot/consts.py",
     "sqlglot/core.py",
+    "sqlglot/dialects/beam.py",
     "sqlglot/dialects/crane.py",
     "sqlglot/dialects/duck.py",
     "sqlglot/dialects/gander.py",
     "sqlglot/expr.py",
     "sqlglot/lonely.py",
     "sqlglot/mod.py",
+    "sqlglot/optimizer/simplify.py",
     "sqlglot/other.py",
+    "sqlglot/tokens.py",
 )
 
 TESTS = [
@@ -124,6 +127,24 @@ SYMBOLS = {
         ["Crane", 1, 7, "class"],
         ["Crane.span", 6, 7, "function"],
     ],
+    # 1-5 class Beam(Dialect-analog, dialect-scoped L4 through class_scope),
+    # 4-5 Beam.shift reads self.WEEK_OFFSET.
+    "sqlglot/dialects/beam.py": [
+        ["Beam", 1, 5, "class"],
+        ["Beam.shift", 4, 5, "function"],
+    ],
+    # 1-3 TokenType, 6-10 class Tokenizer (K UNKNOWN L4 case), 9-10 escape.
+    "sqlglot/tokens.py": [
+        ["TokenType", 1, 3, "class"],
+        ["Tokenizer", 6, 10, "class"],
+        ["Tokenizer.escape", 9, 10, "function"],
+    ],
+    # 1-2 week_offset reads `dialect.WEEK_OFFSET`, 5-6 numeric_escape reads
+    # `tokenizer.NUMERIC_ESCAPES` (both param receivers = instance_lines).
+    "sqlglot/optimizer/simplify.py": [
+        ["week_offset", 1, 2, "function"],
+        ["numeric_escape", 5, 6, "function"],
+    ],
     "sqlglot/__init__.py": [],
 }
 
@@ -157,6 +178,10 @@ USAGE = {
     },
     "sqlglot/lonely.py": {"TAG": [2, 5]},
     "sqlglot/dialects/crane.py": {"SPANS": [2, 7]},
+    # Definition line + the self-read inside Beam.shift.
+    "sqlglot/dialects/beam.py": {"WEEK_OFFSET": [2, 5]},
+    # Definition line + the self-read inside Tokenizer.escape.
+    "sqlglot/tokens.py": {"NUMERIC_ESCAPES": [7, 10]},
 }
 
 FIXTURES = {    "tests/fixtures/a.sql": ["tests/test_mod.py::test_beta"],
@@ -183,6 +208,10 @@ USAGE_REFS = {
     # A definition line of a *different* OPTIONS constant: reference maps list
     # it, but it must not contribute tests (it executes at import time).
     "OPTIONS": {"sqlglot/dialects/gander.py": [5]},
+    # Parameter-receiver reads (the 535z `dialect.WEEK_OFFSET` shape and the
+    # Tokenizer mirror shape).
+    "WEEK_OFFSET": {"sqlglot/optimizer/simplify.py": [2]},
+    "NUMERIC_ESCAPES": {"sqlglot/optimizer/simplify.py": [6]},
 }
 
 TEST_IDS_ORDINAL = [test["id"] for test in TESTS]
@@ -194,16 +223,18 @@ DIALECTS = {
         TEST_IDS_ORDINAL[1]: ["default"],
         TEST_IDS_ORDINAL[2]: ["default", "crane"],
         TEST_IDS_ORDINAL[3]: ["duck", "default"],
-        TEST_IDS_ORDINAL[4]: ["duck"],
+        TEST_IDS_ORDINAL[4]: ["duck", "beam"],
         TEST_IDS_ORDINAL[5]: ["default"],
         TEST_IDS_ORDINAL[6]: ["gander"],
     },
     "file_scope": {
+        "sqlglot/dialects/beam.py": "beam",
         "sqlglot/dialects/crane.py": "crane",
         "sqlglot/dialects/duck.py": "duck",
         "sqlglot/dialects/gander.py": "gander",
     },
     "class_scope": {
+        "sqlglot/dialects/beam.py": {"Beam": "beam"},
         "sqlglot/dialects/crane.py": {"Crane": "crane"},
         "sqlglot/dialects/duck.py": {"Duck": "duck"},
         "sqlglot/dialects/gander.py": {"Gander": "gander"},
@@ -235,23 +266,61 @@ CLASSES = {
         "sqlglot.TriggerChild": ["sqlglot.expr.Trigger"],
         "sqlglot.lonely.Lonely": [],
         "sqlglot.dialects.crane.Crane": [],
+        # A Tokenizer hierarchy leaf: the class graph knows it, but it is not an
+        # expression class, so L4's universe stays UNKNOWN for it.
+        "sqlglot.tokens.Tokenizer": [],
     },
 }
 
-# L4: reference lines of a name split into instance-style (``self``/``cls``) and
-# everything else.  ``TAG`` is deliberately absent (constructors + class spans
-# only); ``SPANS`` has no non-instance reads at all.
+# L4: reference lines of a name split by receiver kind (W1f format).
+# ``TAG`` is deliberately absent (constructors + class spans only); ``SPANS``
+# has no non-instance reads at all.  ``WEEK_OFFSET``/``NUMERIC_ESCAPES`` read
+# through a *parameter* receiver in optimizer/simplify.py: instance_lines.
+# Their real failing test is the one reading that line, and only the family
+# universe decides whether it survives L4.
+#
+#   week_offset:     test_alpha covers Beam's span (0)      -> spans
+#                    test_extra reads simplify.py:2 (4)     -> beam exposure
+#                    test_delta reads simplify.py:2 (5)     -> NOT beam-exposed
+#   numeric_escape:  test_metadata covers Tokenizer's span (3) -> spans
+#                    test_delta reads simplify.py:6 (5)        -> instance_lines
 USAGE_STYLE = {
     "ARG_TYPES": {
         "sqlglot/expr.py": {
             "self_lines": [7, 18],
-            "other_lines": [26],
+            "class_lines": [26],
+            "instance_lines": [],
         },
     },
     "SPANS": {
         "sqlglot/dialects/crane.py": {
             "self_lines": [7],
-            "other_lines": [],
+            "class_lines": [],
+            "instance_lines": [],
+        },
+    },
+    "WEEK_OFFSET": {
+        "sqlglot/dialects/beam.py": {
+            "self_lines": [5],
+            "class_lines": [],
+            "instance_lines": [],
+        },
+        "sqlglot/optimizer/simplify.py": {
+            "self_lines": [],
+            "class_lines": [],
+            "instance_lines": [2],
+        },
+    },
+    "NUMERIC_ESCAPES": {
+        "sqlglot/tokens.py": {
+            "self_lines": [10],
+            "class_lines": [],
+            "instance_lines": [],
+        },
+        "sqlglot/optimizer/simplify.py": {
+            "self_lines": [],
+            "class_lines": [],
+            "instance_lines": [6],
         },
     },
 }
@@ -355,6 +424,13 @@ COVERAGE = {
     # test_metadata runs Lonely.show; test_gamma reads Lonely.TAG statically.
     "sqlglot/lonely.py": [(2, [(9, 1)]), (3, [(4, 2)])],
     "sqlglot/dialects/crane.py": [(2, [(6, 2)]), (4, [(6, 2)])],
+    # L4 universe cases: Beam's span is covered by test_alpha (0), while the
+    # only evidence for test_extra (4) is the parameter read it covers.
+    "sqlglot/dialects/beam.py": [(0, [(1, 5)])],
+    # Tokenizer's span is covered by test_metadata (3); the parameter read of
+    # NumericEscapes is covered only by test_delta (5).
+    "sqlglot/tokens.py": [(3, [(6, 5)])],
+    "sqlglot/optimizer/simplify.py": [(4, [(2, 1)]), (5, [(2, 1), (6, 1)])],
 }
 
 PATCHES = {
@@ -592,6 +668,27 @@ diff --git a/sqlglot/dialects/crane.py b/sqlglot/dialects/crane.py
 +        "a": 2,
      }
 """,
+    # 535z-shaped: a dialect class-body attr whose real failing test reads it
+    # through a *parameter* receiver (instance_lines).  Only the dialect-path
+    # universe (= exposure of `beam`) can keep test_extra here.
+    "l4-dialect-param": """\
+diff --git a/sqlglot/dialects/beam.py b/sqlglot/dialects/beam.py
+--- a/sqlglot/dialects/beam.py
++++ b/sqlglot/dialects/beam.py
+@@ -2,1 +2,1 @@ class Beam:
+-    WEEK_OFFSET = 1
++    WEEK_OFFSET = 2
+""",
+    # Mirror: a Tokenizer class-body attr.  K is UNKNOWN (instance creation is
+    # not traced), so the instance_lines reader must stay in the union.
+    "l4-tokenizer-instance": """\
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -7,1 +7,1 @@ class Tokenizer:
+-    NUMERIC_ESCAPES = {"x": 1}
++    NUMERIC_ESCAPES = {"x": 2}
+""",
 }
 
 # Selected test numbers per synthetic commit (Tier E includes every test).
@@ -603,8 +700,9 @@ EXPECTATIONS = {
     "malformed": {0, 1, 2, 3, 4, 5, 6},
     "module-dict": {0, 3, 4},
     "testpy": {3, 4, 6},
-    # v2 refinements.  Dialect narrowing drops test_gamma (default-only).
-    "dialect-class-body": {0, 3, 6},
+    # v2 refinements.  Dialect narrowing drops test_gamma (default-only);
+    # test_extra is duck-exposed through L4's family universe.
+    "dialect-class-body": {0, 3, 4, 6},
     "dialect-symbol": {0, 4, 6},
     # L3: the changed key has no readers, so the collapse is the key-readers.
     "keyread-collapse": {0, 1, 2, 3, 4},
@@ -630,6 +728,12 @@ EXPECTATIONS = {
     "l4-missing-usage": {0, 3, 5},
     # L4 = {0, 2, 4}; only crane-exposed tests survive dialect narrowing.
     "l4-dialect": {0, 2},
+    # 535z shape: L4 = exposure(beam) {4} + Beam's span {0}; test_delta (5)
+    # reads the same parameter-receiver line but is not beam-exposed, so it is
+    # dropped.  Dialect narrowing keeps only beam-exposed tests: {4}.
+    "l4-dialect-param": {4},
+    # Tokenizer mirror: L4 = span {3} + the instance_lines reader {5}.
+    "l4-tokenizer-instance": {3, 5},
 }
 
 
