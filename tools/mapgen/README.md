@@ -188,7 +188,7 @@ of that target are byte-identical for every file in the bundle (sha256).
 | `symbols.json.gz` | `{path: [[qualname, start, end, "function"\|"class"]]}` |
 | `usage.json.gz` | `{path: {NAME: [same-file reference lines]}}` — `Name.id` **and** `Attribute.attr` matches, definition lines excluded |
 | `usage_refs.json.gz` | `{NAME: {referencing file: [lines]}}` — same v2 reference rule, all files (see deviations) |
-| `usage_style.json.gz` | `{NAME: {file: {"self_lines": [...], "other_lines": [...]}}}` — the same references split by read style (L4) |
+| `usage_style.json.gz` | `{NAME: {file: {"self_lines": [...], "class_lines": [...], "instance_lines": [...]}}}` — the same references split 3 ways by receiver kind (L4) |
 | `fixtures.json.gz` | `{non-.py file: [test ids]}` + `__test_files__` + `__shared__` |
 | `dialects.json.gz` | `{"exposure": {test: [dialect keys]}, "file_scope": {path: key}, "class_scope": {path: {Class: key}}}` |
 | `keyreads.json.gz` | `{"exposure": {test: [[NAME, KEY], …]}, "usage_kind": {path: {NAME: "keyable"\|"opaque"}}}` |
@@ -291,20 +291,43 @@ key set W2c uses for its ≥90 % coverage gate.
 
 ### usage_style.json.gz (L4)
 
-`{NAME: {file: {"self_lines": [...], "other_lines": [...]}}}` for every name
-assigned at module or class body level, cross-file like `usage_refs`. A
-reference is `self_`-style when it is an `Attribute` whose value is the literal
-`Name` `self` or `cls` (`self.arg_types`, `cls.arg_types`); everything else --
-plain `Name` reads (`WEEK_OFFSET`) and qualified attribute reads
-(`dialect.WEEK_OFFSET`, `self.dialect.WEEK_OFFSET`, `expression.arg_types`) --
-is `other_lines`. Definition lines are excluded, exactly like `usage`.
-The split is per occurrence, so a line holding both kinds lands in both lists.
+`{NAME: {file: {"self_lines": [...], "class_lines": [...], "instance_lines": [...]}}}`
+for every name assigned at module or class body level, cross-file like
+`usage_refs`. Definition lines are excluded, exactly like `usage`. The split is
+per *occurrence*, so a line holding both `self.X` and `dialect.X` appears in
+both lists.
 
-Unlike `usage_refs`, names whose references all live in the defining file are
-kept (the split is also used for same-file class-body edits), so this map is a
-superset of `usage_refs`' keys. 1347 names / 5090 file entries / 3817 self
-lines / 20978 other lines at the pin; ≈ 76 KB gzipped, independent of which
-tests ran.
+* `self_lines` — `Attribute` whose value is the literal `Name` `self` or `cls`
+  (`self.arg_types`, `cls.arg_types`). These only execute on instances of the
+  defining class (or a subclass), which `classes.json.gz` already proves.
+* `class_lines` — the receiver statically resolves to a **class or module**:
+  attribute chains rooted at a module alias bound by the file's imports
+  (`exp.TriggerProperties.arg_types` with `from sqlglot import expressions as
+  exp`; module re-export aliases such as `from sqlglot import exp` are followed
+  through `sqlglot/__init__.py`'s own alias), chains rooted at a known
+  hierarchy class name (`TriggerProperties.arg_types`, `**Cast.arg_types`), and
+  bare module-scope `Name` reads (`WEEK_OFFSET`) that no enclosing function
+  binds — global reads, kept conservative. `cls.Sub.ATTR` stays here too: the
+  root is a class object, never an instance.
+* `instance_lines` — everything else: reads through plain lowercase
+  variables/parameters whose root is neither a module nor a class
+  (`dialect.WEEK_OFFSET` with `dialect` a parameter, `expression.arg_types`,
+  `self.dialect.WEEK_OFFSET`, `node.arg_types`).
+
+The walker tracks function/lambda/comprehension scopes, so the same text can be
+classified differently in different scopes: `exp.arg_types` is `class_lines`
+when `exp` is the imported module alias, but `instance_lines` inside
+`sqlglot/expressions/core.py`'s alias helpers, where `exp` is a parameter (an
+`Expression`) shadowing the module name. A bare `arg_types` that an enclosing
+function binds locally (`arg_types = list(node.arg_types)[...]`) is
+`instance_lines`; one that resolves at module scope is `class_lines`. `global
+X` declarations correctly restore the module reading.
+
+Unlike `usage_refs` this table keeps names whose references all live in the
+defining file (the split is also used for same-file class-body edits), so the
+map is a superset of `usage_refs`' keys. 1347 names / 5090 file entries /
+3817 self lines / 7261 class lines / 13719 instance lines at the pin; ≈ 79 KB
+gzipped, independent of which tests ran.
 
 
 ## Sizes and timing (measured on this host, linux/amd64 under Rosetta)
@@ -462,8 +485,21 @@ real v2 cost is the extra spawn workers' instrumentation, which only exists for
   index; absent keys would have counted as "untraced" and could disable the
   rule on an otherwise complete trace.
 * **`usage_style.json.gz` keys are a superset of `usage_refs.json.gz`**: names
-  whose references are all same-file are kept (the self/other split is also
-  needed for same-file class-body edits). Both maps exclude definition lines.
+  whose references are all same-file are kept (the split is also needed for
+  same-file class-body edits). Both maps exclude definition lines.
+* **`usage_style` split is 3-way** (`self`/`class`/`instance`) per MAPS_SPEC's
+  updated entry; `other_lines` is gone. `class_lines` is the conservative
+  bucket: any receiver that resolves to a module alias or a hierarchy class
+  name, plus bare global reads. Only `self_lines`/`instance_lines` are
+  candidates for L4 narrowing, and only for class families whose instance
+  universe is captured (`classes.touched`, `dialects.exposure`); for any other
+  family (Tokenizer/Parser/Generator class bodies) `instance_lines` stays in
+  the union.
+* **`inspect_maps.py` still validates the old 2-key split**: it requires
+  `{"self_lines", "other_lines"}`, so it reports one `bad split` error per
+  file entry for the new map. Validating the 3-key bundle needs that check
+  updated to `{"self_lines", "class_lines", "instance_lines"}` (owned by the
+  inspector's workstream; a local 2-line copy passes with 0 errors).
 * **Plumbing artifacts under `/tmp` are disposable; only `maps/` is committed.**
   `maps/.gitkeep` is untouched. The plumbing runs above wrote to
   `/tmp/w1e-*`; `maps/` was not regenerated by this workstream (the full-suite

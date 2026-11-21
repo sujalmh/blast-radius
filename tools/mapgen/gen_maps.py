@@ -546,50 +546,381 @@ def build_usage(trees: dict[str, ast.AST]):
 
 
 _INSTANCE_NAMES = frozenset({"self", "cls"})
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_STYLE_SELF = 0
+_STYLE_CLASS = 1
+_STYLE_INSTANCE = 2
 
 
-def build_usage_style(trees: dict[str, ast.AST]) -> dict:
-    """maps/usage_style.json.gz: NAME -> file -> self/other reference lines.
+class _StyleScope:
+    """One function/lambda/comprehension scope during the style walk."""
+
+    __slots__ = ("bound", "modules", "declared_global")
+
+    def __init__(self) -> None:
+        self.bound: set[str] = set()
+        self.modules: dict[str, str] = {}
+        self.declared_global: set[str] = set()
+
+
+def _root_name(node) -> str | None:
+    """Leftmost ``Name.id`` of a pure ``Attribute`` chain, else ``None``."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _bind_target(target, out: set[str]) -> None:
+    if isinstance(target, ast.Name):
+        out.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _bind_target(element, out)
+    elif isinstance(target, ast.Starred):
+        _bind_target(target.value, out)
+
+
+def _bind_arguments(arguments, out: set[str]) -> None:
+    for arg in (
+        list(getattr(arguments, "posonlyargs", ()))
+        + list(arguments.args)
+        + list(arguments.kwonlyargs)
+        + [arguments.vararg, arguments.kwarg]
+    ):
+        if arg is not None:
+            out.add(arg.arg)
+
+
+def _import_module_bindings(
+    node,
+    dotted: str,
+    is_package: bool,
+    module_table: dict[str, str],
+    module_exports: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """``local name -> dotted sqlglot module`` for one Import/ImportFrom.
+
+    ``import sqlglot.dialects as d`` binds ``d``; ``import sqlglot.dialects``
+    binds ``sqlglot``; ``from sqlglot import expressions as exp`` binds ``exp``
+    to the ``sqlglot.expressions`` module (also when the name is only re-exported
+    by the imported module, e.g. ``from sqlglot import exp`` ->
+    ``sqlglot/__init__.py``'s ``exp`` alias).
+    """
+    out: dict[str, str] = {}
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.asname:
+                if alias.name in module_table:
+                    out[alias.asname] = alias.name
+            else:
+                head = alias.name.split(".", 1)[0]
+                if head in module_table:
+                    out[head] = head
+        return out
+    base = _absolute_base(dotted, is_package, node)
+    if not base:
+        return out
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        local = alias.asname or alias.name
+        candidate = f"{base}.{alias.name}"
+        if candidate in module_table:
+            out[local] = candidate
+            continue
+        exported = module_exports.get(base, {}).get(alias.name)
+        if exported:
+            out[local] = exported
+    return out
+
+
+def _module_scope_aliases(
+    tree: ast.AST,
+    dotted: str,
+    is_package: bool,
+    module_table: dict[str, str],
+    module_exports: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    """Module-scope ``name -> dotted module`` bindings of one file."""
+    out: dict[str, str] = {}
+    for node in _module_level_imports(getattr(tree, "body", [])):
+        for local, target in _import_module_bindings(
+            node, dotted, is_package, module_table, module_exports
+        ).items():
+            out.setdefault(local, target)
+    return out
+
+
+def _module_scope_class_bindings(
+    tree: ast.AST,
+    dotted: str,
+    is_package: bool,
+    class_leaves: set[str],
+    classes_by_module: dict[str, set[str]],
+) -> set[str]:
+    """Names bound at module scope to a sqlglot class (``... import C as Alias``)."""
+    out: set[str] = set()
+    for node in _module_level_imports(getattr(tree, "body", [])):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        known = classes_by_module.get(_absolute_base(dotted, is_package, node) or "", set())
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            if alias.name in class_leaves or alias.name in known:
+                out.add(alias.asname or alias.name)
+    return out
+
+
+def _scan_bindings(
+    node,
+    scope: _StyleScope,
+    dotted: str,
+    is_package: bool,
+    module_table: dict[str, str],
+    module_exports: dict[str, dict[str, str]],
+) -> None:
+    """Collect the names one scope binds (nested scopes excluded)."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        scope.bound.add(node.name)
+        return
+    if isinstance(node, (ast.Lambda, *_COMPREHENSIONS)):
+        return
+    if isinstance(node, ast.Global):
+        scope.declared_global.update(node.names)
+        return
+    if isinstance(node, ast.Nonlocal):
+        return
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            scope.bound.add(alias.asname or alias.name.split(".", 1)[0])
+        scope.modules.update(
+            _import_module_bindings(node, dotted, is_package, module_table, module_exports)
+        )
+        return
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            _bind_target(target, scope.bound)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+        _bind_target(node.target, scope.bound)
+    elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+        _bind_target(node.optional_vars, scope.bound)
+    elif isinstance(node, ast.ExceptHandler) and node.name:
+        scope.bound.add(node.name)
+    elif isinstance(node, ast.NamedExpr):
+        _bind_target(node.target, scope.bound)
+    elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+        scope.bound.add(node.name)
+    for child in ast.iter_child_nodes(node):
+        _scan_bindings(child, scope, dotted, is_package, module_table, module_exports)
+
+
+def _new_scope(
+    arguments,
+    body_nodes,
+    dotted: str,
+    is_package: bool,
+    module_table: dict[str, str],
+    module_exports: dict[str, dict[str, str]],
+) -> _StyleScope:
+    scope = _StyleScope()
+    if arguments is not None:
+        _bind_arguments(arguments, scope.bound)
+    for node in body_nodes:
+        _scan_bindings(node, scope, dotted, is_package, module_table, module_exports)
+    return scope
+
+
+class _StyleWalker:
+    """Classify every ``Name.id`` / ``Attribute.attr`` occurrence of one file.
+
+    ``module_aliases`` are the module-scope imports of the file (``exp`` ->
+    ``sqlglot.expressions``) and ``class_names`` the names that statically
+    denote a sqlglot class (every hierarchy leaf name plus aliased class
+    imports).  Function/class/comprehension scopes are tracked so a bare name
+    read is only called a *global* read when no enclosing scope binds it (a
+    local ``arg_types = [...]`` is not a read of the class attribute table).
+    """
+
+    def __init__(
+        self,
+        dotted: str,
+        is_package: bool,
+        module_aliases: dict[str, str],
+        class_names: set[str],
+        module_table: dict[str, str],
+        module_exports: dict[str, dict[str, str]],
+        assigned: set[str],
+    ) -> None:
+        self.dotted = dotted
+        self.is_package = is_package
+        self.module_aliases = module_aliases
+        self.class_names = class_names
+        self.module_table = module_table
+        self.module_exports = module_exports
+        self.assigned = assigned
+        self.frames: list[_StyleScope] = []
+        self.refs: dict[str, list[set[int]]] = {}
+
+    def _record(self, name: str, kind: int, line: int) -> None:
+        if name not in self.assigned:
+            return
+        entry = self.refs.get(name)
+        if entry is None:
+            entry = self.refs[name] = [set(), set(), set()]
+        entry[kind].add(line)
+
+    def _resolve_root(self, name: str) -> int:
+        """Class/module when ``name`` denotes a module or a class, else instance."""
+        for frame in reversed(self.frames):
+            if name in frame.declared_global:
+                break
+            if name in frame.modules:
+                return _STYLE_CLASS
+            if name in frame.bound:
+                return _STYLE_INSTANCE
+        if name in self.module_aliases or name in self.class_names:
+            return _STYLE_CLASS
+        return _STYLE_INSTANCE
+
+    def _is_local(self, name: str) -> bool:
+        for frame in reversed(self.frames):
+            if name in frame.declared_global:
+                return False
+            if name in frame.bound or name in frame.modules:
+                return True
+        return False
+
+    def _scope_for(self, arguments, body_nodes) -> _StyleScope:
+        return _new_scope(
+            arguments,
+            body_nodes,
+            self.dotted,
+            self.is_package,
+            self.module_table,
+            self.module_exports,
+        )
+
+    def visit(self, node) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Decorators, annotations and defaults are evaluated in the
+            # enclosing scope; visit them before pushing the function scope.
+            for child in node.decorator_list:
+                self.visit(child)
+            self.visit(node.args)
+            if node.returns is not None:
+                self.visit(node.returns)
+            for param in getattr(node, "type_params", ()) or ():
+                self.visit(param)
+            self.frames.append(self._scope_for(node.args, node.body))
+            for statement in node.body:
+                self.visit(statement)
+            self.frames.pop()
+            return
+        if isinstance(node, ast.Lambda):
+            self.visit(node.args)
+            self.frames.append(self._scope_for(node.args, []))
+            self.visit(node.body)
+            self.frames.pop()
+            return
+        if isinstance(node, _COMPREHENSIONS):
+            scope = _StyleScope()
+            for generator in node.generators:
+                _bind_target(generator.target, scope.bound)
+            self.frames.append(scope)
+            for generator in node.generators:
+                self.visit(generator.target)
+                self.visit(generator.iter)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for part in (
+                getattr(node, "key", None),
+                getattr(node, "value", None),
+                getattr(node, "elt", None),
+            ):
+                if part is not None:
+                    self.visit(part)
+            self.frames.pop()
+            return
+        if isinstance(node, ast.ClassDef):
+            for child in list(node.decorator_list) + list(node.bases):
+                self.visit(child)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            for param in getattr(node, "type_params", ()) or ():
+                self.visit(param)
+            for statement in node.body:
+                self.visit(statement)
+            return
+        if isinstance(node, ast.Name):
+            kind = _STYLE_INSTANCE if self._is_local(node.id) else _STYLE_CLASS
+            self._record(node.id, kind, node.lineno)
+        elif isinstance(node, ast.Attribute):
+            self._record(node.attr, self._attribute_kind(node), node.lineno)
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+
+    def _attribute_kind(self, node) -> int:
+        value = node.value
+        if isinstance(value, ast.Name) and value.id in _INSTANCE_NAMES:
+            return _STYLE_SELF
+        root = _root_name(value)
+        if root is None:
+            return _STYLE_INSTANCE
+        if root == "cls":
+            # ``cls.Sub.ATTR`` still reads through the class object, never an
+            # instance: keep it out of the droppable instance bucket.
+            return _STYLE_CLASS
+        return self._resolve_root(root)
+
+
+def build_usage_style(trees: dict[str, ast.AST], hierarchy: dict[str, list[str]]) -> dict:
+    """maps/usage_style.json.gz: NAME -> file -> 3-way reference-line split.
 
     Same reference rule as ``usage``/``usage_refs`` (``Name.id`` *and*
     ``Attribute.attr`` matches, the name's own definition lines excluded), but
     every reference line is classified by *how* the name is read:
 
-    * ``self_lines``  -- ``Attribute`` whose value is the literal ``Name``
+    * ``self_lines``     -- ``Attribute`` whose value is the literal ``Name``
       ``self`` or ``cls`` (``self.arg_types``, ``cls.arg_types``).  These only
       execute on instances of the defining class (or a subclass), which
       ``classes.json.gz`` already proves, so a rule may narrow them to the
       constructing tests.
-    * ``other_lines`` -- every other reference: plain ``Name`` reads
-      (``WEEK_OFFSET``) and attribute reads through something that is not
-      ``self``/``cls`` (``dialect.WEEK_OFFSET``, ``self.dialect.WEEK_OFFSET``)
-      -- qualified reads that may fire for any instance or no instance at all.
+    * ``class_lines``    -- the receiver statically resolves to a class or a
+      module: attribute chains rooted at a module alias bound by the file's
+      imports (``exp.TriggerProperties.arg_types`` with ``from sqlglot import
+      expressions as exp``), chains rooted at a known hierarchy class name
+      (``TriggerProperties.arg_types``), and bare module-scope ``Name`` reads
+      (``WEEK_OFFSET`` not bound by any enclosing function) -- global reads,
+      kept conservative.
+    * ``instance_lines`` -- everything else: reads through plain lowercase
+      variables/parameters whose root is not a module or class
+      (``dialect.WEEK_OFFSET`` with ``dialect`` a parameter,
+      ``expression.arg_types``, ``self.dialect.WEEK_OFFSET``).
 
     The split is per *occurrence*: a line holding both ``self.X`` and
     ``dialect.X`` appears in both lists.  Unlike ``usage_refs`` this table keeps
     names whose references all live in the defining file, because the split is
     also used for same-file class-body edits.
     """
-    refs: dict[str, dict[str, tuple[set[int], set[int]]]] = {}
+    module_table = {_module_dotted(rel): rel for rel in trees}
+    module_exports: dict[str, dict[str, str]] = {}
     for rel, tree in trees.items():
-        local: dict[str, tuple[set[int], set[int]]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                entry = local.get(node.id)
-                if entry is None:
-                    entry = local[node.id] = (set(), set())
-                entry[1].add(node.lineno)
-            elif isinstance(node, ast.Attribute):
-                entry = local.get(node.attr)
-                if entry is None:
-                    entry = local[node.attr] = (set(), set())
-                value = node.value
-                if isinstance(value, ast.Name) and value.id in _INSTANCE_NAMES:
-                    entry[0].add(node.lineno)
-                else:
-                    entry[1].add(node.lineno)
-        for name, (self_lines, other_lines) in local.items():
-            refs.setdefault(name, {})[rel] = (self_lines, other_lines)
+        exported = _module_scope_aliases(
+            tree, _module_dotted(rel), rel.endswith("__init__.py"), module_table, {}
+        )
+        if exported:
+            module_exports[_module_dotted(rel)] = exported
+
+    class_leaves: set[str] = set()
+    classes_by_module: dict[str, set[str]] = {}
+    for qname in hierarchy:
+        prefix, _, leaf = qname.rpartition(".")
+        class_leaves.add(leaf)
+        if prefix in module_table:
+            classes_by_module.setdefault(prefix, set()).add(leaf)
 
     definitions: dict[str, dict[str, set[int]]] = {}
     assigned: set[str] = set()
@@ -598,17 +929,42 @@ def build_usage_style(trees: dict[str, ast.AST]) -> dict:
             definitions.setdefault(name, {})[rel] = lines
             assigned.add(name)
 
+    refs: dict[str, dict[str, list[set[int]]]] = {}
+    for rel, tree in sorted(trees.items()):
+        dotted = _module_dotted(rel)
+        is_package = rel.endswith("__init__.py")
+        walker = _StyleWalker(
+            dotted,
+            is_package,
+            _module_scope_aliases(tree, dotted, is_package, module_table, module_exports),
+            class_leaves
+            | _module_scope_class_bindings(
+                tree, dotted, is_package, class_leaves, classes_by_module
+            ),
+            module_table,
+            module_exports,
+            assigned,
+        )
+        walker.visit(tree)
+        for name, (self_lines, class_lines, instance_lines) in walker.refs.items():
+            refs.setdefault(name, {})[rel] = [self_lines, class_lines, instance_lines]
+
     payload: dict[str, dict[str, dict[str, list[int]]]] = {}
     for name in sorted(assigned):
         by_file: dict[str, dict[str, list[int]]] = {}
         own_defs = definitions.get(name, {})
         for rel in sorted(refs.get(name, {})):
-            self_lines, other_lines = refs[name][rel]
+            self_lines, class_lines, instance_lines = refs[name][rel]
             own = own_defs.get(rel, set())
             kept_self = sorted(self_lines - own)
-            kept_other = sorted(other_lines - own)
-            if kept_self or kept_other:
-                by_file[rel] = {"self_lines": kept_self, "other_lines": kept_other}
+            kept_class = sorted(class_lines - own)
+            kept_instance = sorted(instance_lines - own)
+            if kept_self or kept_class or kept_instance:
+                by_file[rel] = {
+                    "self_lines": kept_self,
+                    "class_lines": kept_class,
+                    "instance_lines": kept_instance,
+                }
         if by_file:
             payload[name] = by_file
     return payload
@@ -1526,18 +1882,19 @@ def main(argv: list[str] | None = None) -> int:
         f"crossfile_names={len(crossfile)}"
     )
 
-    style = build_usage_style(trees)
+    hierarchy, hierarchy_stats = build_class_hierarchy(trees)
+    style = build_usage_style(trees, hierarchy)
     style_size = _write_gz(os.path.join(out, "usage_style.json.gz"), _json_bytes(style))
-    style_self = sum(
-        len(detail["self_lines"]) for files in style.values() for detail in files.values()
-    )
-    style_other = sum(
-        len(detail["other_lines"]) for files in style.values() for detail in files.values()
-    )
+    style_counts = {"self_lines": 0, "class_lines": 0, "instance_lines": 0}
+    for files in style.values():
+        for detail in files.values():
+            for key in style_counts:
+                style_counts[key] += len(detail[key])
     log(
         f"usage_style: names={len(style)} file_entries="
-        f"{sum(len(files) for files in style.values())} self_lines={style_self} "
-        f"other_lines={style_other}"
+        f"{sum(len(files) for files in style.values())} "
+        f"self_lines={style_counts['self_lines']} class_lines={style_counts['class_lines']} "
+        f"instance_lines={style_counts['instance_lines']}"
     )
 
     trace: dict[str, list[str]] = {}
@@ -1616,7 +1973,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    hierarchy, hierarchy_stats = build_class_hierarchy(trees)
     classes, class_stats = build_classes(dynamic, test_ids, hierarchy)
     classes_size = _write_gz(os.path.join(out, "classes.json.gz"), _json_bytes(classes))
     log(
