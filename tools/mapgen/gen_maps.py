@@ -11,8 +11,9 @@ Inputs are produced by ``run_maps.sh``:
 Outputs (all 0644, deterministic gzip: mtime=0, no filename in the header):
 
   tests_index.json, coverage.bin.gz, symbols.json.gz, usage.json.gz,
-  usage_refs.json.gz, fixtures.json.gz, dialects.json.gz, keyreads.json.gz,
-  testimports.json.gz, source.tar.gz, MANIFEST.json
+  usage_refs.json.gz, usage_style.json.gz, fixtures.json.gz, dialects.json.gz,
+  keyreads.json.gz, testimports.json.gz, classes.json.gz, source.tar.gz,
+  MANIFEST.json
 
 Format details live in MAPS_SPEC.md; this script is the only writer.  It is
 stdlib-only except for ``coverage.numbits`` (installed in the mapgen image).
@@ -158,6 +159,10 @@ def _merge_dynamic(target: dict, payload: dict, include_stats: bool) -> None:
         entry = target["keys"].setdefault(bucket, {})
         for name, keys in by_name.items():
             entry.setdefault(name, set()).update(str(key) for key in keys)
+    for bucket, names in (payload.get("classes") or {}).items():
+        target["classes"].setdefault(bucket, set()).update(
+            name for name in names if isinstance(name, str)
+        )
     for name, origin in (payload.get("names") or {}).items():
         target["names"].setdefault(name, origin)
     target["skipped"].update(payload.get("skipped") or ())
@@ -182,6 +187,7 @@ def load_dynamic(dynamic_path: str) -> tuple[dict, dict[str, int]]:
     merged: dict = {
         "dialects": {},
         "keys": {},
+        "classes": {},
         "names": {},
         "skipped": set(),
         "stats": {},
@@ -222,12 +228,16 @@ def load_dynamic(dynamic_path: str) -> tuple[dict, dict[str, int]]:
         bucket: {name: sorted(keys) for name, keys in sorted(by_name.items())}
         for bucket, by_name in merged["keys"].items()
     }
+    merged["classes"] = {
+        bucket: sorted(names) for bucket, names in merged["classes"].items()
+    }
     merged["stats"].update(
         {
             "proxied_names": len(merged["names"]),
             "key_pairs": sum(
                 len(keys) for by_name in merged["keys"].values() for keys in by_name.values()
             ),
+            "class_pairs": sum(len(names) for names in merged["classes"].values()),
             "dialect_buckets": len(merged["dialects"]),
             "traces": stats["parents"] + stats["children"],
             "child_traces": stats["children"],
@@ -533,6 +543,75 @@ def build_usage(trees: dict[str, ast.AST]):
         if any(path not in files for path in by_file):
             crossfile[name] = dict(sorted(by_file.items()))
     return usage, crossfile
+
+
+_INSTANCE_NAMES = frozenset({"self", "cls"})
+
+
+def build_usage_style(trees: dict[str, ast.AST]) -> dict:
+    """maps/usage_style.json.gz: NAME -> file -> self/other reference lines.
+
+    Same reference rule as ``usage``/``usage_refs`` (``Name.id`` *and*
+    ``Attribute.attr`` matches, the name's own definition lines excluded), but
+    every reference line is classified by *how* the name is read:
+
+    * ``self_lines``  -- ``Attribute`` whose value is the literal ``Name``
+      ``self`` or ``cls`` (``self.arg_types``, ``cls.arg_types``).  These only
+      execute on instances of the defining class (or a subclass), which
+      ``classes.json.gz`` already proves, so a rule may narrow them to the
+      constructing tests.
+    * ``other_lines`` -- every other reference: plain ``Name`` reads
+      (``WEEK_OFFSET``) and attribute reads through something that is not
+      ``self``/``cls`` (``dialect.WEEK_OFFSET``, ``self.dialect.WEEK_OFFSET``)
+      -- qualified reads that may fire for any instance or no instance at all.
+
+    The split is per *occurrence*: a line holding both ``self.X`` and
+    ``dialect.X`` appears in both lists.  Unlike ``usage_refs`` this table keeps
+    names whose references all live in the defining file, because the split is
+    also used for same-file class-body edits.
+    """
+    refs: dict[str, dict[str, tuple[set[int], set[int]]]] = {}
+    for rel, tree in trees.items():
+        local: dict[str, tuple[set[int], set[int]]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                entry = local.get(node.id)
+                if entry is None:
+                    entry = local[node.id] = (set(), set())
+                entry[1].add(node.lineno)
+            elif isinstance(node, ast.Attribute):
+                entry = local.get(node.attr)
+                if entry is None:
+                    entry = local[node.attr] = (set(), set())
+                value = node.value
+                if isinstance(value, ast.Name) and value.id in _INSTANCE_NAMES:
+                    entry[0].add(node.lineno)
+                else:
+                    entry[1].add(node.lineno)
+        for name, (self_lines, other_lines) in local.items():
+            refs.setdefault(name, {})[rel] = (self_lines, other_lines)
+
+    definitions: dict[str, dict[str, set[int]]] = {}
+    assigned: set[str] = set()
+    for rel, tree in trees.items():
+        for name, lines in assigned_bindings(tree).items():
+            definitions.setdefault(name, {})[rel] = lines
+            assigned.add(name)
+
+    payload: dict[str, dict[str, dict[str, list[int]]]] = {}
+    for name in sorted(assigned):
+        by_file: dict[str, dict[str, list[int]]] = {}
+        own_defs = definitions.get(name, {})
+        for rel in sorted(refs.get(name, {})):
+            self_lines, other_lines = refs[name][rel]
+            own = own_defs.get(rel, set())
+            kept_self = sorted(self_lines - own)
+            kept_other = sorted(other_lines - own)
+            if kept_self or kept_other:
+                by_file[rel] = {"self_lines": kept_self, "other_lines": kept_other}
+        if by_file:
+            payload[name] = by_file
+    return payload
 
 
 # -------------------------------------------------------------------- testing
@@ -985,6 +1064,243 @@ def build_keyreads(
     return {"exposure": dict(sorted(exposure.items())), "usage_kind": usage_kind}, stats
 
 
+# ------------------------------------------------------------------- classes
+def _module_dotted(rel: str) -> str:
+    if rel == "sqlglot/__init__.py":
+        return "sqlglot"
+    if rel.endswith("/__init__.py"):
+        return rel[: -len("/__init__.py")].replace("/", ".")
+    return rel[:-3].replace("/", ".")
+
+
+def _public_class_qname(dotted: str, qualname: str) -> str:
+    """Spelling used for both the hierarchy and the trace's class names.
+
+    ``sqlglot/expressions`` is a package whose ``__init__.py`` star-imports
+    every submodule, so the *public* name of a class defined in
+    ``sqlglot/expressions/ddl.py`` is ``sqlglot.expressions.TriggerProperties``
+    (one level, like the committed selectors expect) and not
+    ``sqlglot.expressions.ddl.TriggerProperties``.  Unique in the pinned tree:
+    1078 classes, no duplicate leaf names and no nested classes under
+    ``sqlglot/expressions/``, so collapsing cannot merge two classes.
+    """
+    if dotted == "sqlglot.expressions" or dotted.startswith("sqlglot.expressions."):
+        return "sqlglot.expressions." + qualname
+    return f"{dotted}.{qualname}"
+
+
+def _iter_classes(body, prefix: str = "") -> list[tuple[str, list]]:
+    """(qualname, bases) for every ClassDef reachable at module/class scope."""
+    found: list[tuple[str, list]] = []
+    for node in body:
+        if isinstance(node, ast.ClassDef):
+            qualname = f"{prefix}.{node.name}" if prefix else node.name
+            found.append((qualname, list(node.bases)))
+            found.extend(_iter_classes(node.body, qualname))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        else:
+            for _field, child in ast.iter_fields(node):
+                if isinstance(child, list):
+                    statements = [item for item in child if isinstance(item, ast.stmt)]
+                    if statements:
+                        found.extend(_iter_classes(statements, prefix))
+    return found
+
+
+def _dotted_text(node) -> str | None:
+    """``a.b.c`` for a pure Name/Attribute chain, else ``None``."""
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _from_dotted(text: str, module_classes: dict[str, dict[str, str]]) -> str | None:
+    parts = text.split(".")
+    for index in range(len(parts) - 1, 0, -1):
+        table = module_classes.get(".".join(parts[:index]))
+        if table:
+            qualname = ".".join(parts[index:])
+            hit = table.get(qualname)
+            if hit:
+                return hit
+    return None
+
+
+def build_class_hierarchy(
+    trees: dict[str, ast.AST],
+) -> tuple[dict[str, list[str]], dict]:
+    """Static ``{class: [sqlglot bases]}`` over the pinned ASTs.
+
+    Bases are resolved through the defining module, the file's own classes and
+    its module-level imports (relative imports included,
+    ``import x as y`` / ``from pkg import module`` aliases understood).  Bases
+    that are not sqlglot classes (``object``, ``enum.Enum``,
+    ``typing.Generic``) and bases the walk cannot resolve are omitted and
+    counted in the returned stats.
+    """
+    rel_dotted = {rel: _module_dotted(rel) for rel in trees}
+    module_table = {dotted: rel for rel, dotted in rel_dotted.items()}
+    definitions: dict[str, list[tuple[str, list]]] = {}
+    own_classes: dict[str, dict[str, str]] = {}
+    module_classes: dict[str, dict[str, str]] = {}
+    leaf_qnames: dict[str, set[str]] = {}
+    for rel, tree in trees.items():
+        dotted = rel_dotted[rel]
+        items: list[tuple[str, list]] = []
+        own: dict[str, str] = {}
+        for qualname, bases in _iter_classes(getattr(tree, "body", [])):
+            qname = _public_class_qname(dotted, qualname)
+            items.append((qname, bases))
+            own[qualname] = qname
+            module_classes.setdefault(dotted, {})[qualname] = qname
+            if dotted == "sqlglot.expressions" or dotted.startswith("sqlglot.expressions."):
+                module_classes.setdefault("sqlglot.expressions", {})[qualname] = qname
+            leaf_qnames.setdefault(qualname.rsplit(".", 1)[-1], set()).add(qname)
+        definitions[rel] = items
+        own_classes[rel] = own
+
+    unique_leaf = {
+        leaf: next(iter(names)) for leaf, names in leaf_qnames.items() if len(names) == 1
+    }
+    stats = {
+        "classes": sum(len(items) for items in definitions.values()),
+        "edges": 0,
+        "unresolved_bases": 0,
+        "unresolved_examples": [],
+    }
+
+    hierarchy: dict[str, list[str]] = {}
+    all_qnames = set(unique_leaf.values()) | {
+        qname for items in definitions.values() for qname, _bases in items
+    }
+    for rel, items in definitions.items():
+        dotted = rel_dotted[rel]
+        is_package = rel.endswith("__init__.py")
+        local_names = dict(own_classes.get(rel, {}))
+        aliases: dict[str, str] = {}
+        for node in _module_level_imports(getattr(trees[rel], "body", [])):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases.setdefault(alias.asname, alias.name)
+                    else:
+                        head = alias.name.split(".")[0]
+                        aliases.setdefault(head, head)
+                continue
+            base = _absolute_base(dotted, is_package, node)
+            if not base:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                target = module_classes.get(base, {}).get(alias.name)
+                if target is not None:
+                    local_names.setdefault(local, target)
+                    continue
+                submodule = f"{base}.{alias.name}"
+                if submodule in module_table:
+                    aliases.setdefault(local, submodule)
+                    continue
+                target = unique_leaf.get(alias.name)
+                if target is not None:
+                    local_names.setdefault(local, target)
+
+        for qname, bases in items:
+            resolved: set[str] = set()
+            for base_node in bases:
+                target = None
+                if isinstance(base_node, ast.Name):
+                    target = local_names.get(base_node.id) or unique_leaf.get(base_node.id)
+                else:
+                    text = _dotted_text(base_node)
+                    if text:
+                        target = _from_dotted(text, module_classes)
+                        head, _, rest = text.partition(".")
+                        if target is None and rest:
+                            # ``Spark.Tokenizer`` / ``Trino.JSONPathTokenizer``:
+                            # a nested class reached through an imported class.
+                            owner = local_names.get(head) or unique_leaf.get(head)
+                            if owner:
+                                candidate = f"{owner}.{rest}"
+                                if candidate in all_qnames:
+                                    target = candidate
+                        if target is None and rest:
+                            module = aliases.get(head)
+                            if module:
+                                target = _from_dotted(f"{module}.{rest}", module_classes)
+                if target is None:
+                    stats["unresolved_bases"] += 1
+                    if len(stats["unresolved_examples"]) < 40:
+                        text = _dotted_text(base_node) or ast.dump(base_node)[:40]
+                        stats["unresolved_examples"].append(f"{qname}({text})")
+                    continue
+                resolved.add(target)
+            hierarchy[qname] = sorted(resolved)
+            stats["edges"] += len(resolved)
+
+    return dict(sorted(hierarchy.items())), stats
+
+
+def _normalize_class_spelling(name: str) -> str:
+    parts = name.split(".")
+    if len(parts) > 3 and parts[0] == "sqlglot" and parts[1] == "expressions":
+        return "sqlglot.expressions." + parts[-1]
+    return name
+
+
+def build_classes(
+    dynamic: dict,
+    test_ids: list[str],
+    hierarchy: dict[str, list[str]],
+) -> tuple[dict, dict[str, int]]:
+    """maps/classes.json.gz: per-test constructed classes + the hierarchy.
+
+    ``touched`` is keyed by test id and holds every sqlglot class the test
+    constructed (the class and its sqlglot ancestors: constructing a subclass
+    runs the base's ``__init__``/methods, so base-name instance reads matter
+    for it).  Every test id of the index is present, with ``[]`` when the test
+    constructed no expression at all: a partial trace must not silently shrink
+    the key set W2c uses to decide whether the map is usable.
+    """
+    known = set(test_ids)
+    stats = {"tests": 0, "pairs": 0, "unknown_classes": 0, "empty_tests": 0}
+    touched: dict[str, set[str]] = {}
+    for bucket, names in (dynamic.get("classes") or {}).items():
+        if bucket not in known:
+            continue  # spare/unknown bucket: not attributable to a test
+        bucket_names = touched.setdefault(bucket, set())
+        for name in names:
+            if not isinstance(name, str) or not name:
+                continue
+            spelling = _normalize_class_spelling(name)
+            if spelling in hierarchy:
+                bucket_names.add(spelling)
+            else:
+                stats["unknown_classes"] += 1
+    payload: dict[str, list[str]] = {}
+    for test_id in test_ids:
+        names = touched.get(test_id)
+        if names:
+            payload[test_id] = sorted(names)
+        else:
+            payload[test_id] = []
+            stats["empty_tests"] += 1
+    stats["tests"] = len(payload) - stats["empty_tests"]
+    stats["pairs"] = sum(len(names) for names in payload.values())
+    return {
+        "touched": {test_id: payload[test_id] for test_id in sorted(payload)},
+        "hierarchy": hierarchy,
+    }, stats
+
+
 # ------------------------------------------------------------------- testimports
 def _module_table(sqlglot_files: list[str]) -> dict[str, str]:
     table: dict[str, str] = {}
@@ -1052,28 +1368,78 @@ def _resolve_imports(
     return found
 
 
+def _support_module_table(checkout: str) -> dict[str, str]:
+    """Dotted name -> path for the test-support modules a test file may import.
+
+    A test file can contain no sqlglot import of its own and still reach the
+    whole package through a helper (``from tests.dialects.test_dialect import
+    Validator``): ``tests/dialects/test_prql.py`` and friends only import
+    ``Validator``.  Following ``tests/**.py`` closes that gap without needing a
+    per-file whitelist; the walk still emits sqlglot modules only.
+    """
+    support: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(os.path.join(checkout, "tests")):
+        dirnames[:] = sorted(d for d in dirnames if d not in {"__pycache__", ".git"})
+        for name in sorted(filenames):
+            if not name.endswith(".py"):
+                continue
+            rel = _rel_under(os.path.join(dirpath, name), checkout)
+            if rel:
+                support[_module_dotted(rel)] = rel
+    if os.path.isfile(os.path.join(checkout, "conftest.py")):
+        support.setdefault("conftest", "conftest.py")
+    return support
+
+
 def build_testimports(
     checkout: str,
     test_files: list[str],
     trees: dict[str, ast.AST],
     sqlglot_files: list[str],
 ) -> tuple[dict, dict[str, int]]:
-    """maps/testimports.json.gz: test file -> transitive sqlglot modules."""
-    table = _module_table(sqlglot_files)
-    stats = {"test_files": 0, "modules": 0, "parse_errors": 0}
+    """maps/testimports.json.gz: test file -> transitive sqlglot modules.
+
+    The closure follows **module-level** imports of the test file and of every
+    ``tests/**.py`` support module it reaches (lazy/function-body imports stay
+    out, as before).  Only sqlglot modules are emitted.
+    """
+    sqlglot_table = _module_table(sqlglot_files)
+    support_table = _support_module_table(checkout)
+    table = dict(support_table)
+    table.update(sqlglot_table)
+    stats = {"test_files": 0, "modules": 0, "parse_errors": 0, "support_modules": 0}
+    parsed: dict[str, ast.AST | None] = {}
+
+    def tree_of(rel: str) -> ast.AST | None:
+        if rel in trees:
+            return trees[rel]
+        if rel in parsed:
+            return parsed[rel]
+        try:
+            tree: ast.AST | None = ast.parse(_read_text(os.path.join(checkout, rel)))
+        except Exception as error:  # noqa: BLE001 - one bad helper must not stop the map
+            log(f"WARNING: cannot parse support module {rel}: {error}")
+            tree = None
+        parsed[rel] = tree
+        return tree
 
     def closure(tree: ast.AST, current: str, is_package: bool) -> set[str]:
         reached: set[str] = set()
+        seen: set[str] = set()
         pending = list(_resolve_imports(tree, current, is_package, table))
         while pending:
             module = pending.pop()
-            if module in reached:
+            if module in seen:
                 continue
-            reached.add(module)
+            seen.add(module)
             rel = table.get(module)
             if rel is None:
                 continue
-            dep_tree = trees.get(rel)
+            if module in sqlglot_table:
+                reached.add(module)
+            else:
+                stats["support_modules"] += 1
+            dep_tree = tree_of(rel)
             if dep_tree is None:
                 continue
             pending.extend(_resolve_imports(dep_tree, module, rel.endswith("__init__.py"), table))
@@ -1160,6 +1526,20 @@ def main(argv: list[str] | None = None) -> int:
         f"crossfile_names={len(crossfile)}"
     )
 
+    style = build_usage_style(trees)
+    style_size = _write_gz(os.path.join(out, "usage_style.json.gz"), _json_bytes(style))
+    style_self = sum(
+        len(detail["self_lines"]) for files in style.values() for detail in files.values()
+    )
+    style_other = sum(
+        len(detail["other_lines"]) for files in style.values() for detail in files.values()
+    )
+    log(
+        f"usage_style: names={len(style)} file_entries="
+        f"{sum(len(files) for files in style.values())} self_lines={style_self} "
+        f"other_lines={style_other}"
+    )
+
     trace: dict[str, list[str]] = {}
     if os.path.isfile(args.trace):
         trace = json.loads(_read_text(args.trace))
@@ -1228,10 +1608,36 @@ def main(argv: list[str] | None = None) -> int:
     testimports, ti_stats = build_testimports(checkout, test_files, trees, sqlglot_files)
     imports_size = _write_gz(os.path.join(out, "testimports.json.gz"), _json_bytes(testimports))
     log(
-        "testimports: files={} modules={} parse_errors={}".format(
-            ti_stats["test_files"], ti_stats["modules"], ti_stats["parse_errors"]
+        "testimports: files={} modules={} support_modules={} parse_errors={}".format(
+            ti_stats["test_files"],
+            ti_stats["modules"],
+            ti_stats["support_modules"],
+            ti_stats["parse_errors"],
         )
     )
+
+    hierarchy, hierarchy_stats = build_class_hierarchy(trees)
+    classes, class_stats = build_classes(dynamic, test_ids, hierarchy)
+    classes_size = _write_gz(os.path.join(out, "classes.json.gz"), _json_bytes(classes))
+    log(
+        "classes: touched_tests={} pairs={} empty_tests={} hierarchy={} edges={} "
+        "unresolved_bases={} unknown_classes={}".format(
+            class_stats["tests"],
+            class_stats["pairs"],
+            class_stats["empty_tests"],
+            hierarchy_stats["classes"],
+            hierarchy_stats["edges"],
+            hierarchy_stats["unresolved_bases"],
+            class_stats["unknown_classes"],
+        )
+    )
+    for example in hierarchy_stats["unresolved_examples"][:10]:
+        log(f"classes: unresolved base {example}")
+    if class_stats["pairs"] == 0:
+        log(
+            "WARNING: class trace is empty (BR_CLASSES=0?); classes.json.gz only has "
+            "the hierarchy -- L4 must degrade to the usage rule"
+        )
 
     file_sha1 = {
         rel: hashlib.sha1(sources[rel].encode("utf-8")).hexdigest() for rel in sqlglot_files
@@ -1252,6 +1658,10 @@ def main(argv: list[str] | None = None) -> int:
             "coverage_file_pairs": sum(len(tests) for tests in per_file.values()),
             "fixtures": fx_stats["fixture_files"],
             "keyread_pairs": kr_stats["pairs"],
+            "class_pairs": class_stats["pairs"],
+            "classes_hierarchy": hierarchy_stats["classes"],
+            "usage_style_names": len(style),
+            "testimport_modules": ti_stats["modules"],
         },
         "keyreads": {
             "proxied_names": len(dynamic.get("names") or {}),
@@ -1263,9 +1673,21 @@ def main(argv: list[str] | None = None) -> int:
             "opaque_reasons": kind_stats["reasons"],
             "dynamic_stats": dynamic.get("stats") or {},
         },
+        "classes": {
+            "touched_tests": class_stats["tests"],
+            "empty_tests": class_stats["empty_tests"],
+            "pairs": class_stats["pairs"],
+            "unknown_classes": class_stats["unknown_classes"],
+            "hierarchy_classes": hierarchy_stats["classes"],
+            "hierarchy_edges": hierarchy_stats["edges"],
+            "unresolved_bases": hierarchy_stats["unresolved_bases"],
+            "unresolved_examples": hierarchy_stats["unresolved_examples"],
+        },
         "capture": {
-            "version": 2,
+            "version": 3,
             "subprocess_trace": True,
+            "class_trace": True,
+            "usage_style": True,
             "dynamic_parents": dynamic_stats["parents"],
             "dynamic_children": dynamic_stats["children"],
         },
@@ -1282,25 +1704,29 @@ def main(argv: list[str] | None = None) -> int:
             "symbols.json.gz",
             "usage.json.gz",
             "usage_refs.json.gz",
+            "usage_style.json.gz",
             "fixtures.json.gz",
             "dialects.json.gz",
             "keyreads.json.gz",
             "testimports.json.gz",
+            "classes.json.gz",
             "source.tar.gz",
             "MANIFEST.json",
         )
     )
     log(
-        "sizes: coverage={}B symbols={}B usage={}B refs={}B fixtures={}B dialects={}B "
-        "keyreads={}B testimports={}B source={}B manifest={}B total={}B".format(
+        "sizes: coverage={}B symbols={}B usage={}B refs={}B style={}B fixtures={}B dialects={}B "
+        "keyreads={}B testimports={}B classes={}B source={}B manifest={}B total={}B".format(
             coverage_size,
             symbols_size,
             usage_size,
             refs_size,
+            style_size,
             fixtures_size,
             dialects_size,
             keyreads_size,
             imports_size,
+            classes_size,
             source_size,
             manifest_size,
             total,

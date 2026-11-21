@@ -27,10 +27,11 @@ docker run --rm --platform linux/amd64 \
 ```
 
 That single pytest session produces **all** maps: coverage, symbols, usage,
-fixtures, source tarball **and** the three dynamic maps
-(`dialects.json.gz`, `keyreads.json.gz`, `testimports.json.gz`). There is no
-second pytest pass. Inside `run_maps.sh` the session is: collect → traced
-pytest (parent + spawned workers) → `coverage combine` → `gen_maps.py`.
+fixtures, source tarball, the static class hierarchy/usage-style split **and**
+the three traced maps (`dialects.json.gz`, `keyreads.json.gz`,
+`classes.json.gz`). There is no second pytest pass. Inside `run_maps.sh` the
+session is: collect → traced pytest (parent + spawned workers) →
+`coverage combine` → `gen_maps.py`.
 
 `BR_GENERATOR_GIT` is recorded in `MANIFEST.json` (optional).
 
@@ -74,6 +75,25 @@ python3 bench/probe.py --maps /tmp/br1c cover-lines \
   sqlglot/optimizer/eliminate_joins.py 62 74     # -> 61-65,67,69-74
 ```
 
+L4 plumbing run (classes + usage style, ~19 s): one pool-driven, one inline and
+one dialect test, exactly the mixed set used to validate the class trace:
+
+```sh
+mkdir -p /tmp/br-l4
+docker run --rm --platform linux/amd64 -v /tmp/br-l4:/out blast-mapgen /out \
+  'tests/test_optimizer.py::TestOptimizer::test_tpcds' \
+  'tests/test_expressions.py::TestExprs::test_ref_type_builder' \
+  'tests/dialects/test_teradata.py::TestTeradata::test_execute'
+python3 tools/mapgen/inspect_maps.py --maps /tmp/br-l4 --name WEEK_OFFSET
+```
+
+Measured result: 87 / 6 / 21 distinct classes for those three tests (tpcds
+constructs the most, and 68 of them are the node types of the 99 optimized
+tpcds queries themselves; teradata's `test_execute` shares only 20 with it, so
+the sets are clearly test-specific), `hierarchy` 1294 classes / 1996 edges /
+892 direct `Expression` subclasses, and 0 integrity errors. Two identical runs
+of that target are byte-identical for every file in the bundle (sha256).
+
 ## Stages
 
 1. **Build** – `fetch_pin.py` downloads `codeload.github.com/…/tar.gz/<sha>`
@@ -113,6 +133,21 @@ python3 bench/probe.py --maps /tmp/br1c cover-lines \
      to plain containers. `BR_KEYREADS=0` / `BR_DIALECTS=0` disable either
      trace; `BR_KEYREADS_SCOPE=core` proxies only the highest-value tables
      (kept as a speed escape hatch; not needed, see timing below).
+   * **Expression construction (L4)**: the `__init__` every
+     `sqlglot.expressions.Expression` subclass executes is wrapped once, right
+     after `sqlglot.expressions.core` is imported, and records the qualified
+     class name for the current test, plus the class' sqlglot ancestors (a test
+     that builds a subclass also runs the base's `__init__`/methods, and a
+     subclass declared inside `tests/` maps onto its sqlglot bases this way).
+     `Expr` defines that slot and `Expression` only inherits it, so patching
+     `Expr` -- not `Expression` -- is the MRO-safe equivalent of the requested
+     `Expression.__init__` wrap (patching `Expression` would shadow
+     `TimeUnit.__init__` for `_TimeUnit(Expression, TimeUnit)` and change unit
+     handling); see `_install_expression_hook` in `trace_conftest.py`.
+     `BR_CLASSES=0` disables it.  Cost: one dict lookup plus a `set.update` per
+     construction (the MRO scan is cached per class) -- inside run-to-run noise
+     (the 3-test plumbing target: 8.09 s with the trace, 8.19 s with
+     `BR_CLASSES=0`).
    * Both traces are written to `/work/dynamic.json` (`/work/trace_reads.json`
      keeps the fixture file reads). `gen_maps.py` post-processes them.
    * **Subprocess coverage (v2, bug 1)**: `tests/test_optimizer.py` and
@@ -153,12 +188,14 @@ python3 bench/probe.py --maps /tmp/br1c cover-lines \
 | `symbols.json.gz` | `{path: [[qualname, start, end, "function"\|"class"]]}` |
 | `usage.json.gz` | `{path: {NAME: [same-file reference lines]}}` — `Name.id` **and** `Attribute.attr` matches, definition lines excluded |
 | `usage_refs.json.gz` | `{NAME: {referencing file: [lines]}}` — same v2 reference rule, all files (see deviations) |
+| `usage_style.json.gz` | `{NAME: {file: {"self_lines": [...], "other_lines": [...]}}}` — the same references split by read style (L4) |
 | `fixtures.json.gz` | `{non-.py file: [test ids]}` + `__test_files__` + `__shared__` |
 | `dialects.json.gz` | `{"exposure": {test: [dialect keys]}, "file_scope": {path: key}, "class_scope": {path: {Class: key}}}` |
 | `keyreads.json.gz` | `{"exposure": {test: [[NAME, KEY], …]}, "usage_kind": {path: {NAME: "keyable"\|"opaque"}}}` |
-| `testimports.json.gz` | `{tests/test_x.py: [sqlglot.module, …]}`, static transitive top-level imports |
+| `testimports.json.gz` | `{tests/test_x.py: [sqlglot.module, …]}`, static transitive top-level imports (incl. `tests/**.py` helpers) |
+| `classes.json.gz` | `{"touched": {test: [class, …]}, "hierarchy": {class: [sqlglot bases]}}` (L4) |
 | `source.tar.gz` | `sqlglot/**/*.py` only, repo-relative member names |
-| `MANIFEST.json` | pinned sha, generator/version metadata, per-file sha1, `keyreads` stats |
+| `MANIFEST.json` | pinned sha, generator/version metadata, per-file sha1, `keyreads`/`classes` stats |
 
 `__shared__` = test-support files imported by ≥2 test files (e.g.
 `tests/helpers.py`, `tests/dialects/test_dialect.py`) plus any `conftest.py`.
@@ -201,6 +238,73 @@ Static closure over **module-level** imports only: `tests/x.py` top-level
 module-level imports (relative imports resolved), stopping at the sqlglot
 package boundary. Imports inside function bodies (lazy/`if TYPE_CHECKING:`
 style deferred imports inside functions) are not followed.
+
+Test-support modules are followed too: a dialect test file often imports only
+`Validator` (`from tests.dialects.test_dialect import Validator`), so the walk
+descends into `tests/**.py` (and a root `conftest.py`) and continues from that
+file's module-level imports, emitting sqlglot modules only. Before that fix
+nine test files had an empty list
+(`test_prql`, `test_risingwave`, `test_tableau`, `test_dax`, `test_drill`,
+`test_fabric`, `test_materialize`, `test_pipe_syntax`, `test_sqlglotc`);
+the first eight now resolve (41 modules each, via `test_dialect`).
+`tests/test_sqlglotc.py` genuinely has no sqlglot import -- it runs
+`sqlglotc/setup.py` through `runpy` and mocks `setuptools` -- so
+`inspect_maps.py` reports an empty list as a note instead of an error.
+Module counts grow ~25 % raw (1902 → 2379 for the full run); **no** module
+crosses W2c's 80 % import-share threshold that did not before (checked on the
+committed full-run map), and the file is still ≈ 1.5 KB gzipped.
+
+### classes.json.gz (L4)
+
+`touched` maps every test id of the index (all 1620, exactly like
+`tests_index.json`) to the sqlglot classes the test constructed. Names use the
+**public** package spelling: `sqlglot.expressions.TriggerProperties`, not
+`sqlglot.expressions.ddl.TriggerProperties` (the class' `__module__`). The
+`sqlglot/expressions` package star-imports its submodules and the pinned tree
+has 1078 expression classes with no duplicate leaf names and no nested classes,
+so collapsing the subpackage is unambiguous; W2c's `_class_spellings` accepts
+both spellings anyway. Tracing is collision-free.
+
+Every constructed class is recorded together with its sqlglot **ancestors**
+(the whole sqlglot MRO): constructing `TriggerProperties` constructs an
+`Expression`, and a subclass declared inside a test file resolves to its
+sqlglot bases. W2c may therefore union/expand either way; expansion is
+idempotent.
+
+`hierarchy` is `{class: [direct sqlglot bases]}` for **all 1294 classes** of the
+pin (not only expressions: `Dialect`, `Tokenizer`, `Scope`, … are needed by
+L4's class-attribute rule), 1996 edges. Bases are resolved through the defining
+module, the file's own classes and its module-level imports (relative imports,
+`import x as y`, `from pkg import module`, `from sqlglot import exp` module
+aliases, and nested-class paths such as `Spark.Tokenizer`).
+**25 bases stay unresolved** and are omitted (counted in
+`MANIFEST.classes.unresolved_bases`, examples logged): 24 are simply not
+sqlglot classes (`t.TypedDict`, `str`, `Enum`, `IntEnum`, `Exception`,
+`abc.ABC`, `type`, `t.Protocol`, `t.NamedTuple`, `Mapping[...]`) and 1 is a
+class-attribute alias (`Databricks.JSONPathTokenizer(Spark.JSONPathTokenizer)`,
+where `Spark` only rebinds the name in its class body). None of them is on the
+Expression path.
+
+`empty_tests` / empty lists: a test that constructs no expression still gets
+its key (with `[]`), so a plumbing-sized trace can never silently shrink the
+key set W2c uses for its ≥90 % coverage gate.
+
+### usage_style.json.gz (L4)
+
+`{NAME: {file: {"self_lines": [...], "other_lines": [...]}}}` for every name
+assigned at module or class body level, cross-file like `usage_refs`. A
+reference is `self_`-style when it is an `Attribute` whose value is the literal
+`Name` `self` or `cls` (`self.arg_types`, `cls.arg_types`); everything else --
+plain `Name` reads (`WEEK_OFFSET`) and qualified attribute reads
+(`dialect.WEEK_OFFSET`, `self.dialect.WEEK_OFFSET`, `expression.arg_types`) --
+is `other_lines`. Definition lines are excluded, exactly like `usage`.
+The split is per occurrence, so a line holding both kinds lands in both lists.
+
+Unlike `usage_refs`, names whose references all live in the defining file are
+kept (the split is also used for same-file class-body edits), so this map is a
+superset of `usage_refs`' keys. 1347 names / 5090 file entries / 3817 self
+lines / 20978 other lines at the pin; ≈ 76 KB gzipped, independent of which
+tests ran.
 
 
 ## Sizes and timing (measured on this host, linux/amd64 under Rosetta)
@@ -334,5 +438,33 @@ real v2 cost is the extra spawn workers' instrumentation, which only exists for
   `Expr.required_args` cannot be followed statically; any such name that shows
   up in the trace is classified `opaque` in `gen_maps.py` and counted as
   `unclassified` in the log/MANIFEST.
-* Plumbing artifacts under `/tmp` are disposable; only `maps/` is committed.
-  `maps/.gitkeep` is untouched.
+* **`capture.version` is 3** (was 2): the bundle gained the class-construction
+  trace and the usage-style split. `class_trace` / `usage_style` flags record
+  that; readers that gate on `>= 2` keep working.
+* **`__init__` override audit** (asked for by W1e): 41 classes in `sqlglot/`
+  define their own `__init__`. Only three sit on the `Expression` construction
+  path: `Expr` (the wrapped slot itself -- it *is* `Expression.__init__`'s
+  defining class), `TimeUnit` (a mixin in `_TimeUnit(Expression, TimeUnit)`'s
+  MRO) and `DateTrunc` (an `Expression` subclass). Both overriders call
+  `super().__init__(...)`, so they reach the wrapped `Expr.__init__`; no
+  `Expression` subclass overrides `__init__` without calling `super()`. That is
+  why one wrap is complete, and why it is installed on `Expr` rather than
+  `Expression` (a new `__init__` slot on `Expression` would shadow
+  `TimeUnit.__init__` for `_TimeUnit` and change unit unabbreviation).
+* **Construction is recorded with ancestors**: `touched[test]` holds the
+  constructed class *and* its sqlglot MRO, e.g. `TriggerProperties` contributes
+  `TriggerProperties`, `Expression`, `Expr`. This is a superset of the literal
+  "type(self)" reading of the format; it is what makes test-local subclasses
+  (`class Custom(TriggerProperties)` in `tests/`) resolve without a hierarchy
+  entry, and W2c's own descendant expansion makes it idempotent.
+* **`classes.touched` has a key for every test id** (empty list when the test
+  constructed no expression). W2c disables L4 below 90 % coverage of the test
+  index; absent keys would have counted as "untraced" and could disable the
+  rule on an otherwise complete trace.
+* **`usage_style.json.gz` keys are a superset of `usage_refs.json.gz`**: names
+  whose references are all same-file are kept (the self/other split is also
+  needed for same-file class-body edits). Both maps exclude definition lines.
+* **Plumbing artifacts under `/tmp` are disposable; only `maps/` is committed.**
+  `maps/.gitkeep` is untouched. The plumbing runs above wrote to
+  `/tmp/w1e-*`; `maps/` was not regenerated by this workstream (the full-suite
+  run is the orchestrator's).

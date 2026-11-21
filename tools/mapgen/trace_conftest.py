@@ -2,7 +2,7 @@
 
 Copied into the sqlglot checkout root at *runtime* by ``run_maps.sh`` (it is
 never baked into the pinned tree) and loaded with ``pytest -p trace_conftest``.
-It produces every *dynamic* input the three map families need, in one pytest
+It produces every *dynamic* input the map families need, in one pytest
 session:
 
 1. File reads (``maps/fixtures.json.gz`` input).  Wraps ``builtins.open``,
@@ -48,7 +48,18 @@ session:
    ``gen_maps.py`` normalises the same way and only ever compares the emitted
    form.
 
-5. Subprocess tracing (MAPS_SPEC "Mapgen v2", bug 1).  ``tests/test_optimizer.py``
+5. Expression construction (``maps/classes.json.gz`` input, L4).  The base
+   ``__init__`` that every ``sqlglot.expressions.Expression`` subclass runs
+   (``sqlglot.expressions.core.Expr.__init__`` -- see ``_install_expression_hook``
+   for why patching that slot instead of ``Expression.__init__`` is the
+   MRO-safe equivalent) is wrapped once, at import time of that module, and
+   records the qualified name of the constructed class for the current test.
+   The class' sqlglot ancestors are recorded too (a test that constructs a
+   subclass does construct the base's code), which also resolves subclasses
+   defined inside the test files themselves.  Spawned workers record it exactly
+   like the dialect/key traces (``_br_task`` sets the current-test state).
+
+6. Subprocess tracing (MAPS_SPEC "Mapgen v2", bug 1).  ``tests/test_optimizer.py``
    and ``tests/test_executor.py`` run every fixture-driven case in a
    ``ProcessPoolExecutor(mp_context=get_context("spawn"))``, so the parent's
    per-test coverage/dialect/key traces never see the real work.  Fix:
@@ -78,6 +89,7 @@ Environment:
   BR_COVERAGE=0     disable the coverage driver (trace only)
   BR_KEYREADS=0     disable the constant-key proxies
   BR_DIALECTS=0     disable the dialect-exposure trace
+  BR_CLASSES=0      disable the expression-construction trace
   BR_KEYREADS_SCOPE all|core  which constants to proxy (default: all)
   BR_SUBPROCESS_TRACE=0  disable the ProcessPoolExecutor submit wrapper
   BR_CHILD_TRACE   set to 1 by this module for spawned children; the
@@ -115,6 +127,7 @@ COVERAGE_FILE = os.environ.get("BR_COVERAGE_FILE", ".coverage")
 COVERAGE_ENABLED = os.environ.get("BR_COVERAGE", "1") != "0"
 KEYREADS_ENABLED = os.environ.get("BR_KEYREADS", "1") != "0"
 DIALECTS_ENABLED = os.environ.get("BR_DIALECTS", "1") != "0"
+CLASSES_ENABLED = os.environ.get("BR_CLASSES", "1") != "0"
 KEYREADS_SCOPE = os.environ.get("BR_KEYREADS_SCOPE", "all")
 SUBPROCESS_TRACE = os.environ.get("BR_SUBPROCESS_TRACE", "1") != "0"
 # True only inside a spawned worker (the sitecustomize shim imports this module
@@ -161,6 +174,18 @@ def _add_text(name: str, key) -> None:
     except Exception:  # noqa: BLE001 - never break a test over tracing
         pass
 _CUR_DIA = None  # set: dialect names, or None outside a test
+
+# Expression construction (L4).  ``_CUR_CLASSES`` is always a *set*: reads
+# outside a test land in the module-local sink and are dropped (import-time
+# construction is not attributable to a test), mirroring ``_CUR_KEYS``.
+_classes: dict[str, set[str]] = {}
+_SINK_CLASSES: set[str] = set()
+_CUR_CLASSES = _SINK_CLASSES
+# type -> tuple of qualified names (the class plus its sqlglot ancestors).  The
+# MRO scan runs once per class; the per-instantiation cost is one dict lookup
+# plus one set.update, which is what keeps the hot path cheap.
+_CLASS_QN: dict = {}
+_EXPR_HOOK: dict = {"hooked": False}
 
 _DIA: dict = {"hooked": False, "dialect": None, "reverse": {}}
 
@@ -444,6 +469,10 @@ _PROXY_CLASS = {
 _SKIP_NAMES = frozenset({"__all__", "__builtins__", "__annotations__", "__dict__"})
 _SKIP_PREFIX = ("__",)
 
+# Modules that define the expression base class (single-module pins) or the
+# module that holds it (package layout: ``expressions/core.py``).
+_EXPRESSION_MODULES = frozenset({"sqlglot.expressions", "sqlglot.expressions.core"})
+
 # High-value subset used when BR_KEYREADS_SCOPE=core is needed for speed.
 _CORE_NAME_SUFFIXES = (
     "KEYWORDS",
@@ -568,6 +597,11 @@ def _patch_module(module) -> None:
             _skipped.add(f"{name} (module patch: {type(error).__name__})")
     if DIALECTS_ENABLED and name == "sqlglot.dialects.dialect":
         _install_dialect_hooks(module)
+    if CLASSES_ENABLED and name in _EXPRESSION_MODULES:
+        try:
+            _install_expression_hook(module)
+        except Exception as error:  # noqa: BLE001 - tracing must not break imports
+            _skipped.add(f"{name} (expression hook: {type(error).__name__})")
 
 # ------------------------------------------------------------------- import hook
 class _PatchLoader(importlib.abc.Loader):
@@ -609,7 +643,7 @@ class _PatchFinder(importlib.abc.MetaPathFinder):
 
 
 def _install_import_hook() -> None:
-    if not (KEYREADS_ENABLED or DIALECTS_ENABLED):
+    if not (KEYREADS_ENABLED or DIALECTS_ENABLED or CLASSES_ENABLED):
         return
     try:
         sys.meta_path.insert(0, _PatchFinder())
@@ -713,6 +747,98 @@ def _dia_record(klass) -> None:
         return
 
 
+# ------------------------------------------------- expression construction (L4)
+def _class_names(ty) -> tuple[str, ...]:
+    """Qualified names of *ty* and every sqlglot class it inherits from.
+
+    ``sqlglot.expressions.Expression`` subclasses inherit ``__init__`` from
+    ``Expr``; a test that constructs ``TriggerProperties`` therefore also
+    constructs an ``Expression``.  Recording the whole sqlglot MRO (once per
+    class) means the selector can expand construction evidence without knowing
+    which spelling a test-local subclass used -- a subclass declared inside
+    ``tests/`` maps onto the sqlglot classes whose ``__init__``/methods it runs.
+    """
+    names = _CLASS_QN.get(ty)
+    if names is None:
+        found: set[str] = set()
+        try:
+            mro = type.__getattribute__(ty, "__mro__")
+        except Exception:  # noqa: BLE001 - never break a test
+            mro = (ty,)
+        for base in mro:
+            module = getattr(base, "__module__", "") or ""
+            if module == "sqlglot" or module.startswith("sqlglot."):
+                found.add(module + "." + getattr(base, "__name__", ""))
+        names = tuple(sorted(found))
+        _CLASS_QN[ty] = names
+    return names
+
+
+def _install_expression_hook(expression_module) -> None:
+    """Wrap the ``__init__`` every Expression subclass runs, once.
+
+    MAPS_SPEC/W2c ask for ``sqlglot.expressions.Expression.__init__``.  In the
+    pinned tree ``Expression`` does not define ``__init__`` itself: it inherits
+    it from ``Expr`` (``sqlglot/expressions/core.py``), and classes such as
+    ``_TimeUnit(Expression, TimeUnit)`` rely on the MRO picking *TimeUnit*'s
+    ``__init__`` first.  ``setattr(Expression, "__init__", ...)`` would insert a
+    new slot into ``Expression``, shadow ``TimeUnit.__init__`` for those
+    subclasses and change behaviour, so the wrapper replaces the *defining*
+    class' ``__init__`` instead: identical call graph, same orders, zero
+    behavioural change.  Subclasses that override ``__init__`` and call
+    ``super()`` are still caught (that call reaches the wrapper); the only
+    construction this cannot see is an override that never calls ``super()``.
+    Audit at the pin: 41 classes in ``sqlglot/`` define ``__init__``; the only
+    ones on the Expression construction path are ``Expr`` (the wrapped slot
+    itself), ``TimeUnit`` (a mixin in ``_TimeUnit``'s MRO) and ``DateTrunc`` (an
+    Expression subclass), and both overriders call ``super().__init__(...)``.
+    No Expression subclass overrides ``__init__`` without calling super, so one
+    wrap is complete -- see the README's "``__init__`` override audit".
+    """
+    if _EXPR_HOOK["hooked"]:
+        return
+    expression = getattr(expression_module, "Expression", None)
+    if not isinstance(expression, type):
+        return
+    try:
+        mro = type.__getattribute__(expression, "__mro__")
+    except Exception:  # noqa: BLE001
+        return
+    defining = None
+    for klass in mro:
+        if "__init__" in klass.__dict__:
+            defining = klass
+            break
+    if defining is None:
+        return
+    original_init = defining.__dict__["__init__"]
+
+    @functools.wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        if _CUR_CLASSES is not _SINK_CLASSES:
+            try:
+                try:
+                    names = _CLASS_QN[type(self)]
+                except KeyError:
+                    names = _class_names(type(self))
+                _CUR_CLASSES.update(names)
+            except Exception:  # noqa: BLE001 - never break a test
+                pass
+        original_init(self, *args, **kwargs)
+
+    try:
+        defining.__init__ = patched_init  # type: ignore[assignment]
+    except Exception as error:  # noqa: BLE001 - a missing trace beats broken code
+        _skipped.add(f"{defining.__module__}.__init__ ({type(error).__name__})")
+        return
+    _EXPR_HOOK["hooked"] = True
+    print(
+        f"[trace_conftest] expression construction hook installed on "
+        f"{defining.__module__}.{defining.__name__}.__init__",
+        file=sys.stderr,
+    )
+
+
 # --------------------------------------------------- subprocess (spawn) tracing
 # Spawned pool workers are fresh interpreters: the proxies/dialect hooks only
 # exist there because ``br_trace_boot`` (loaded from a .pth in site-packages)
@@ -741,14 +867,16 @@ def _br_task(test_id, fn, *args, **kwargs):
     execute inside the worker land in the right test bucket, then switch the
     coverage context (parallel-mode data is saved at process exit).
     """
-    global _current_test, _CUR_KEYS, _CUR_DIA, _CHILD_TASKS
-    previous = (_current_test, _CUR_KEYS, _CUR_DIA)
+    global _current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES, _CHILD_TASKS
+    previous = (_current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES)
     if test_id:
         _current_test = test_id
         if KEYREADS_ENABLED:
             _CUR_KEYS = _keyreads.setdefault(test_id, defaultdict(set))
         if DIALECTS_ENABLED:
             _CUR_DIA = _dialects.setdefault(test_id, set())
+        if CLASSES_ENABLED:
+            _CUR_CLASSES = _classes.setdefault(test_id, set())
     coverage_instance = _child_coverage()
     if coverage_instance is not None and test_id:
         try:
@@ -774,7 +902,7 @@ def _br_task(test_id, fn, *args, **kwargs):
                 coverage_instance.switch_context("")
             except Exception:  # noqa: BLE001
                 pass
-        _current_test, _CUR_KEYS, _CUR_DIA = previous
+        _current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES = previous
         _CHILD_TASKS += 1
         if _CHILD_TASKS % _CHILD_FLUSH_EVERY == 0:
             _child_flush()
@@ -919,12 +1047,14 @@ def pytest_collection_finish(session):
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
-    global _current_test, _CUR_KEYS, _CUR_DIA
+    global _current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES
     _current_test = item.nodeid
     if KEYREADS_ENABLED:
         _CUR_KEYS = _keyreads.setdefault(item.nodeid, defaultdict(set))
     if DIALECTS_ENABLED:
         _CUR_DIA = _dialects.setdefault(item.nodeid, set())
+    if CLASSES_ENABLED:
+        _CUR_CLASSES = _classes.setdefault(item.nodeid, set())
     if _coverage is not None:
         try:
             _coverage.switch_context(item.nodeid)
@@ -936,6 +1066,7 @@ def pytest_runtest_protocol(item, nextitem):
         _current_test = None
         _CUR_KEYS = _SINK
         _CUR_DIA = None
+        _CUR_CLASSES = _SINK_CLASSES
         if _coverage is not None:
             try:
                 _coverage.switch_context("")
@@ -981,9 +1112,13 @@ def _dynamic_payload() -> dict:
     dialects_payload = {
         bucket: sorted(names) for bucket, names in _dialects.items() if names
     }
+    classes_payload = {
+        bucket: sorted(names) for bucket, names in _classes.items() if names
+    }
     return {
         "dialects": dialects_payload,
         "keys": keys_payload,
+        "classes": classes_payload,
         "names": _names,
         "skipped": sorted(_skipped),
         "stats": {
@@ -992,6 +1127,9 @@ def _dynamic_payload() -> dict:
             "key_pairs": pair_count,
             "sink_pairs": sum(len(keys) for keys in _SINK.values()),
             "dialect_buckets": len(dialects_payload),
+            "class_buckets": len(classes_payload),
+            "class_pairs": sum(len(names) for names in classes_payload.values()),
+            "sink_classes": len(_SINK_CLASSES),
         },
         "child": CHILD_MODE,
     }
@@ -1029,7 +1167,10 @@ def pytest_sessionfinish(session, exitstatus):
     print(
         f"[trace_conftest] dynamic={DYNAMIC_OUT} proxied_names={len(_names)} "
         f"key_buckets={len(keys_payload)} key_pairs={pair_count} "
-        f"dialect_buckets={len(dialects_payload)} skipped={len(_skipped)}",
+        f"dialect_buckets={len(dialects_payload)} "
+        f"class_buckets={len(dynamic['classes'])} "
+        f"class_pairs={dynamic['stats']['class_pairs']} "
+        f"sink_classes={len(_SINK_CLASSES)} skipped={len(_skipped)}",
         file=sys.stderr,
     )
     for entry in sorted(_skipped)[:20]:

@@ -234,11 +234,19 @@ def main() -> int:
             print(f"  {test_file}: {len(modules or [])} modules")
             for module in (modules or [])[: args.limit]:
                 print(f"    {module}")
+        # A test file with no statically reachable sqlglot import is a *known*
+        # legitimate state (tests/test_sqlglotc.py runs sqlglotc/setup.py through
+        # runpy and never imports the package), so an empty list is reported,
+        # not failed.  Non-empty lists are still validated strictly.
+        no_import = []
         for test_file, modules in testimports.items():
             if test_files and test_file not in test_files:
                 errors.append(f"testimports.json.gz: {test_file} is not a test file")
-            if not isinstance(modules, list) or not modules:
-                errors.append(f"testimports.json.gz: empty module list for {test_file}")
+            if not isinstance(modules, list):
+                errors.append(f"testimports.json.gz: bad module list for {test_file}")
+                continue
+            if not modules:
+                no_import.append(test_file)
                 continue
             for module in modules:
                 if not isinstance(module, str) or not module.startswith("sqlglot"):
@@ -248,6 +256,96 @@ def main() -> int:
                 if members and not (rel + ".py" in members or rel + "/__init__.py" in members):
                     errors.append(f"testimports.json.gz: unknown module {module} for {test_file}")
                     break
+        print(f"  no static sqlglot import: {len(no_import)} file(s) {no_import[:3]}")
+
+    # -------------------------------------------- classes / usage style (L4)
+    classes = usage_style = None
+    for name, target in (
+        ("classes.json.gz", "classes"),
+        ("usage_style.json.gz", "usage_style"),
+    ):
+        path = os.path.join(args.maps, name)
+        if not os.path.isfile(path):
+            errors.append(f"{name}: missing")
+            continue
+        try:
+            payload = read_gz_json(path)
+        except Exception as error:  # noqa: BLE001
+            errors.append(f"{name}: unreadable ({error})")
+            continue
+        if target == "classes":
+            classes = payload
+        else:
+            usage_style = payload
+
+    if classes is not None:
+        touched = classes.get("touched", {})
+        hierarchy = classes.get("hierarchy", {})
+        print(
+            f"\nclasses.json.gz: touched_tests={len(touched)} "
+            f"pairs={sum(len(v) for v in touched.values() if isinstance(v, list))} "
+            f"hierarchy_classes={len(hierarchy)}"
+        )
+        bad = sorted(set(touched) - index_set)
+        if bad:
+            errors.append(f"classes.json.gz: {len(bad)} touched ids not in index (e.g. {bad[:2]})")
+        for test_id, names in touched.items():
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                errors.append(f"classes.json.gz: bad touched entry for {test_id}")
+                break
+        unknown = sorted(
+            {base for bases in hierarchy.values() if isinstance(bases, list) for base in bases}
+            - set(hierarchy)
+        )
+        if unknown:
+            errors.append(
+                f"classes.json.gz: {len(unknown)} hierarchy bases are not classes "
+                f"(e.g. {unknown[:3]})"
+            )
+        subclasses = sum(
+            1
+            for bases in hierarchy.values()
+            if isinstance(bases, list) and "sqlglot.expressions.Expression" in bases
+        )
+        print(
+            f"  Expression entry: {hierarchy.get('sqlglot.expressions.Expression')} "
+            f"direct subclasses={subclasses} empty_tests="
+            f"{sum(1 for v in touched.values() if v == [])}"
+        )
+        if "sqlglot.expressions.Expression" not in hierarchy:
+            errors.append("classes.json.gz: sqlglot.expressions.Expression missing from hierarchy")
+        if subclasses < 100:
+            errors.append(f"classes.json.gz: only {subclasses} direct Expression subclasses")
+        for test in (args.test,) if args.test else list(sorted(touched))[: args.limit]:
+            names = touched.get(test) or []
+            print(f"  {test}: {len(names)} classes")
+            for name in names[: args.limit]:
+                print(f"    {name}")
+
+    if usage_style is not None:
+        print(
+            f"\nusage_style.json.gz: names={len(usage_style)} "
+            f"file_entries={sum(len(v) for v in usage_style.values())}"
+        )
+        for name, by_file in usage_style.items():
+            if not isinstance(by_file, dict):
+                errors.append(f"usage_style.json.gz: bad entry for {name}")
+                break
+            for rel, detail in by_file.items():
+                if members and rel not in members:
+                    errors.append(f"usage_style.json.gz: path missing from source: {rel}")
+                if not isinstance(detail, dict) or set(detail) != {"self_lines", "other_lines"}:
+                    errors.append(f"usage_style.json.gz: bad split for {name}@{rel}")
+                    continue
+                for key in ("self_lines", "other_lines"):
+                    lines = detail[key]
+                    if not isinstance(lines, list) or not all(
+                        isinstance(line, int) for line in lines
+                    ):
+                        errors.append(f"usage_style.json.gz: bad {key} for {name}@{rel}")
+                        break
+        if args.name:
+            print(f"  {args.name} style: {usage_style.get(args.name)}")
 
     if args.file:
         path = args.file
