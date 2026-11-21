@@ -1,0 +1,34 @@
+................... [  1%]
+........F.............F...........FF.............F....................................... [  6%]
+...................................................... [  9%]
+.......................... [ 11%]
+............................................................................ [ 16%]
+.............................................................. [ 20%]
+.................................................... [ 23%]
+.................................................................................................................................................................................. [ 34%]
+..................................................... [ 37%]
+................................................... [ 40%]
+........................................................................................................................................................................ [ 51%]
+........................... [ 52%]
+............s................................................................ [ 57%]
+.............................................................................................................................................................. [ 67%]
+................................................... [ 70%]
+....................... [ 71%]
+..........................F..F................................................... [ 76%]
+............................................................................................................................... [ 84%]
+...........F................................................................................................................................................................................................................................. [ 99%]
+............                                                        [100%]
+=========================== short test summary info ============================
+FAILED tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery - IndexEr...
+FAILED tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_meta - ...
+FAILED tests/dialects/test_bigquery.py::TestBigQuery::test_merge - IndexError...
+FAILED tests/dialects/test_bigquery.py::TestBigQuery::test_ml_functions - Ind...
+FAILED tests/dialects/test_bigquery.py::TestBigQuery::test_rename_table - Ind...
+FAILED tests/test_expressions.py::TestExprs::test_replace_tables - IndexError...
+FAILED tests/test_expressions.py::TestExprs::test_replace_tables_keeps_function_arguments
+FAILED tests/test_optimizer.py::TestOptimizer::test_qualify_columns - IndexEr...
+SUBFAILED[only information schema] tests/test_optimizer.py::TestOptimizer::test_qualify_tables
+SUBFAILED[bigquery implicit unnest syntax, table is already qualified] tests/test_optimizer.py::TestOptimizer::test_qualify_tables
+SUBFAILED[bigquery implicit unnest syntax, coordinates.position should be a column, not a table] tests/test_optimizer.py::TestOptimizer::test_qualify_tables
+SUBFAILED[DROP SCHEMA for bigquery] tests/test_parser.py::TestParser::test_parse_drop_schema
+12 failed, 1612 passed, 1 skipped, 24168 subtests passed in 155.24s (0:02:35)

@@ -1,0 +1,21 @@
+{
+  "id": "classlit_typing_null",
+  "patch": "corpus/classlit_typing_null.patch",
+  "failing": [
+    "tests/dialects/test_starrocks.py::TestStarrocks::test_map_literal",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_row_types",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_types",
+    "tests/test_optimizer.py::TestOptimizer::test_null_coerce_annotation",
+    "tests/test_optimizer.py::TestOptimizer::test_union_annotation",
+    "tests/test_optimizer.py::TestOptimizer::test_values_annotation",
+    "tests/test_schema.py::TestSchema::test_ref_type"
+  ],
+  "passed": 1615,
+  "failed": 45,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 172.024,
+  "summary": "45 failed, 1615 passed, 1 skipped, 25386 subtests passed in 170.68s (0:02:50)"
+}

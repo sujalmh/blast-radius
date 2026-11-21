@@ -1,0 +1,12 @@
+{
+  "id": "baseline",
+  "patch": "baseline",
+  "failing": [],
+  "passed": 1620,
+  "failed": 0,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 84.237,
+  "summary": "1620 passed, 1 skipped, 25440 subtests passed in 83.43s (0:01:23)"
+}

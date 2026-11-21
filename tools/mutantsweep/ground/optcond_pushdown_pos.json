@@ -1,0 +1,18 @@
+{
+  "id": "optcond_pushdown_pos",
+  "patch": "corpus/optcond_pushdown_pos.patch",
+  "failing": [
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_predicates",
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+    "tests/test_optimizer.py::TestOptimizer::test_tpch"
+  ],
+  "passed": 1619,
+  "failed": 133,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 79.632,
+  "summary": "133 failed, 1619 passed, 1 skipped, 25248 subtests passed in 78.69s (0:01:18)"
+}

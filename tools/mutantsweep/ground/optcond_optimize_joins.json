@@ -1,0 +1,14 @@
+{
+  "id": "optcond_optimize_joins",
+  "patch": "corpus/optcond_optimize_joins.patch",
+  "failing": [
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+  ],
+  "passed": 1620,
+  "failed": 2,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 103.88,
+  "summary": "2 failed, 1620 passed, 1 skipped, 25438 subtests passed in 102.95s (0:01:42)"
+}

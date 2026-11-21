@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Parse one pytest run log into tools/mutantsweep/ground/<id>.json.
 
-Recorded fields:
-    id, patch, failing[]   ground-truth failing test node ids
-    passed, failed, skipped, errors[] (node ids), error_count
-    wall_s                 wall clock of the pytest process inside the image
-    summary                the final pytest summary line (audit trail)
+pytest 9 counts unittest subtests separately, so a single failing test method
+can show up as many "failed" entries and is printed in the short test summary
+as ``SUBFAILED[<context>] tests/...::Test::test_x`` (there is no top-level
+``FAILED`` line in that case).  The ground truth we need is the set of failing
+*test node ids*, so both plain and subtest lines are folded into ``failing``.
 
-Node ids come from pytest's short test summary (``FAILED tests/...``), which
-``-rfE`` guarantees is printed even under ``-q``.
+Recorded fields:
+    id, patch, failing[]      ground-truth failing test node ids (deduped)
+    passed, failed, skipped   pytest's own counters (subtests counted separately)
+    errors[], error_count     collection/setup errors (node ids)
+    wall_s                    pytest wall clock inside the image
+    summary                   final pytest summary line (audit trail)
 """
 
 from __future__ import annotations
@@ -26,10 +30,15 @@ COUNTS = [
     ("error_count", re.compile(r"(\d+) errors?")),
 ]
 
+# "FAILED x", "SUBFAILED[ctx] x", "ERROR x", "SUBERROR[ctx] x", also the
+# "SUBFAIL" spelling some pytest versions use.
+HEAD = re.compile(r"^(SUBFAIL|SUBFAILED|SUBERROR|SUBERRORED|FAILED|ERRORED|ERROR)\b")
+NODE = re.compile(r"(tests/[^\s]+)")
 
-def node_id(line: str) -> str:
-    rest = line.split(" ", 1)[1]
-    return rest.split(" - ", 1)[0].strip()
+
+def node_id(line: str) -> str | None:
+    m = NODE.search(line)
+    return m.group(1) if m else None
 
 
 def parse(log_path: str) -> dict:
@@ -40,41 +49,46 @@ def parse(log_path: str) -> dict:
     errors: list[str] = []
     counts = {"passed": 0, "failed": 0, "skipped": 0, "error_count": 0}
     summary = ""
-    in_summary = False
 
+    # A SUBFAILED report embeds the subtest context, which sqlglot often fills
+    # with multi-line SQL, so the node id can be several lines below the head.
+    # Collect each report block (head line up to the next head/section) and
+    # search the block for the node id.
+    blocks: list[tuple[str, list[str]]] = []
+    current: tuple[str, list[str]] | None = None
     for line in lines:
-        if line.startswith("=== short test summary info ===") or line.startswith(
-            "=========================== short test summary info"
-        ):
-            in_summary = True
+        m = HEAD.match(line)
+        if m:
+            if current is not None:
+                blocks.append(current)
+            current = (m.group(1), [line])
             continue
-        if in_summary:
-            if line.startswith("FAILED "):
-                nid = node_id(line)
-                if nid not in failing:
-                    failing.append(nid)
-                continue
-            if line.startswith("ERROR "):
-                nid = node_id(line)
-                if nid not in errors:
-                    errors.append(nid)
-                continue
-            # end of summary section (progress/exit noise) -- keep scanning, the
-            # final counts line is below it anyway.
-        if line.startswith("FAILED "):
-            nid = node_id(line)
-            if nid not in failing:
-                failing.append(nid)
+        if current is None:
+            continue
+        if line.startswith("=") or line.startswith("---") or re.match(r"^\d+ (passed|failed)", line):
+            blocks.append(current)
+            current = None
+            continue
+        current[1].append(line)
+    if current is not None:
+        blocks.append(current)
+
+    for kind, block_lines in blocks:
+        nid = node_id("\n".join(block_lines))
+        if nid is None:
+            continue
+        bucket = errors if kind.startswith("SUBERROR") or kind == "ERROR" or kind == "ERRORED" else failing
+        if nid not in bucket:
+            bucket.append(nid)
 
     for line in reversed(lines):
-        if " passed" in line or " failed" in line or " error" in line:
-            if re.search(r"\d+ (passed|failed|error)", line):
-                summary = line.strip()
-                for key, rx in COUNTS:
-                    m = rx.search(summary)
-                    if m:
-                        counts[key] = int(m.group(1))
-                break
+        if re.search(r"\d+ (passed|failed|error)", line):
+            summary = line.strip()
+            for key, rx in COUNTS:
+                m2 = rx.search(summary)
+                if m2:
+                    counts[key] = int(m2.group(1))
+            break
 
     counts["error_count"] = max(counts["error_count"], len(errors))
     return {"failing": failing, "errors": errors, "summary": summary, **counts}

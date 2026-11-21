@@ -1,0 +1,14 @@
+{
+  "id": "fixture_eliminate_joins",
+  "patch": "corpus/fixture_eliminate_joins.patch",
+  "failing": [
+    "tests/test_optimizer.py::TestOptimizer::test_eliminate_joins"
+  ],
+  "passed": 1620,
+  "failed": 1,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 177.538,
+  "summary": "1 failed, 1620 passed, 1 skipped, 25439 subtests passed in 176.10s (0:02:56)"
+}

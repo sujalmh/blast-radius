@@ -1,0 +1,14 @@
+{
+  "id": "fixture_qualify_columns",
+  "patch": "corpus/fixture_qualify_columns.patch",
+  "failing": [
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns"
+  ],
+  "passed": 1620,
+  "failed": 1,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 179.951,
+  "summary": "1 failed, 1620 passed, 1 skipped, 25438 subtests passed in 178.69s (0:02:58)"
+}

@@ -1,0 +1,43 @@
+................... [  1%]
+............................................................................................ [  6%]
+....................................... [  9%]
+........................................................................................................................................... [ 17%]
+......................... [ 19%]
+................................................................................................................................................................ [ 29%]
+.................. [ 30%]
+.................... [ 31%]
+.....F........................................... [ 34%]
+...................... [ 35%]
+....... [ 36%]
+...................................................................................................................... [ 43%]
+......................................................................... [ 48%]
+................... [ 49%]
+...................................................................s...................................................................................................................................................................... [ 63%]
+................................................... [ 66%]
+........................................................................................................................ [ 74%]
+........................................................................ [ 78%]
+.................................................................. [ 82%]
+................... [ 84%]
+............................... [ 85%]
+.................................................................................... [ 91%]
+.................................................................................................................................. [ 99%]
+..............                 [100%]
+=========================== short test summary info ============================
+SUBFAILED(kind='SCN', value='123456', alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value='123456', alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value=':scn', alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value=':scn', alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value='(123456 + 1)', alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value='(123456 + 1)', alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value='123456 + 1', alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='SCN', value='123456 + 1', alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value='SYSTIMESTAMP', alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value='SYSTIMESTAMP', alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value='SYSDATE - 1 / 24', alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value='SYSDATE - 1 / 24', alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value="SYSTIMESTAMP - INTERVAL '1' HOUR", alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value="SYSTIMESTAMP - INTERVAL '1' HOUR", alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value="TO_TIMESTAMP('2026-10-10 12:00:00', 'YYYY-MM-DD HH24:MI:SS')", alias='') tests/dialects/test_oracle.py::TestOracle::test_flashback
+SUBFAILED(kind='TIMESTAMP', value="TO_TIMESTAMP('2026-10-10 12:00:00', 'YYYY-MM-DD HH24:MI:SS')", alias=' s') tests/dialects/test_oracle.py::TestOracle::test_flashback
+FAILED tests/dialects/test_oracle.py::TestOracle::test_flashback - AssertionE...
+17 failed, 1619 passed, 1 skipped, 25419 subtests passed in 161.10s (0:02:41)

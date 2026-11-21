@@ -1,0 +1,15 @@
+{
+  "id": "isnone_tsql_gen",
+  "patch": "corpus/isnone_tsql_gen.patch",
+  "failing": [
+    "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+    "tests/dialects/test_tsql.py::TestTSQL::test_tsql"
+  ],
+  "passed": 1620,
+  "failed": 5,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 172.305,
+  "summary": "5 failed, 1620 passed, 1 skipped, 25435 subtests passed in 171.16s (0:02:51)"
+}

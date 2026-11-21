@@ -1,0 +1,16 @@
+{
+  "id": "classlit_hive_regexp_group",
+  "patch": "corpus/classlit_hive_regexp_group.patch",
+  "failing": [
+    "tests/dialects/test_bigquery.py::TestBigQuery::test_regexp_extract",
+    "tests/dialects/test_hive.py::TestHive::test_hive",
+    "tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions"
+  ],
+  "passed": 1620,
+  "failed": 13,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 172.845,
+  "summary": "13 failed, 1620 passed, 1 skipped, 25427 subtests passed in 171.66s (0:02:51)"
+}

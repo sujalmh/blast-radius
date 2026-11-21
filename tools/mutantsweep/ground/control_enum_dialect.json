@@ -1,0 +1,12 @@
+{
+  "id": "control_enum_dialect",
+  "patch": "corpus/control_enum_dialect.patch",
+  "failing": [],
+  "passed": 1620,
+  "failed": 0,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 123.513,
+  "summary": "1620 passed, 1 skipped, 25440 subtests passed in 122.27s (0:02:02)"
+}

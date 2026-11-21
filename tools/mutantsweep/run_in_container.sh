@@ -29,6 +29,9 @@ timeout 1500 python -m pytest tests -q -rfE --tb=no -p no:cacheprovider \
 END=$(date +%s%N)
 WALL_MS=$(( (END - START) / 1000000 ))
 
+mkdir -p "$DATA/logs"
+cp "$LOG" "$DATA/logs/$ID.log"
+
 python /runner/collect.py \
   --id "$ID" \
   --log "$LOG" \

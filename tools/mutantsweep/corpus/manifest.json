@@ -161,9 +161,9 @@
       "group": "f",
       "file": "tests/fixtures/identity.sql",
       "line": 390,
-      "summary": "identity fixture: CAST(a AS INT) -> CAST(a AS VARCHAR)",
+      "summary": "identity fixture: drop the closing paren in CAST (parse-error edit)",
       "patch": "fixture_identity_cast.patch",
-      "sha256": "c95cd45adb8e0a926dc0f83bd6b9352aa59c00d200ce6a56397005384942049c",
+      "sha256": "83bf3af861f2525c41dbda101929b6dcaa09cf54853cfcbef7f2f7a73ad92f09",
       "diff_lines": 11
     },
     {

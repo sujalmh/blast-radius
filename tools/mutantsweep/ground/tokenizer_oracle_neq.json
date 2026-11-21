@@ -1,0 +1,14 @@
+{
+  "id": "tokenizer_oracle_neq",
+  "patch": "corpus/tokenizer_oracle_neq.patch",
+  "failing": [
+    "tests/dialects/test_oracle.py::TestOracle::test_oracle"
+  ],
+  "passed": 1620,
+  "failed": 2,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 172.447,
+  "summary": "2 failed, 1620 passed, 1 skipped, 25438 subtests passed in 171.18s (0:02:51)"
+}

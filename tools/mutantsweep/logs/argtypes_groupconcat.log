@@ -1,0 +1,41 @@
+................... [  1%]
+......................................................F................................F...................................... [  8%]
+....... [  9%]
+........................... [ 11%]
+................................................. [ 14%]
+.............................................................................................................. [ 20%]
+.....................................................................F............................................................F [ 28%]
+...F........................................................................................ [ 34%]
+...................... [ 35%]
+....... [ 36%]
+..............................................F......................................................................... [ 43%]
+...............F [ 44%]
+....................... [ 46%]
+........................................................................................FF................F...........s....................... [ 54%]
+............................................................F............................................. [ 61%]
+.................................................. [ 64%]
+........................................................................................................................................................................... [ 75%]
+........................................................................ [ 79%]
+.......................................... [ 82%]
+................................................................................................................................................................................ [ 93%]
+.......................................................... [ 96%]
+.......................................................                              [100%]
+=========================== short test summary info ============================
+FAILED tests/dialects/test_bigquery.py::TestBigQuery::test_string_agg - sqlgl...
+FAILED tests/dialects/test_clickhouse.py::TestClickhouse::test_groupconcat - ...
+FAILED tests/dialects/test_exasol.py::TestExasol::test_stringFunctions - sqlg...
+FAILED tests/dialects/test_mysql.py::TestMySQL::test_mysql - sqlglot.errors.P...
+FAILED tests/dialects/test_mysql.py::TestMySQL::test_null_ordering_simulation_resolves_ordered_against_projection
+FAILED tests/dialects/test_redshift.py::TestRedshift::test_identity - sqlglot...
+FAILED tests/dialects/test_snowflake.py::TestSnowflake::test_listagg - sqlglo...
+FAILED tests/dialects/test_sqlite.py::TestSQLite::test_group_concat_distinct_separator
+FAILED tests/dialects/test_sqlite.py::TestSQLite::test_group_concat_null_separator
+FAILED tests/dialects/test_sqlite.py::TestSQLite::test_sqlite - sqlglot.error...
+FAILED tests/dialects/test_trino.py::TestTrino::test_listagg - sqlglot.errors...
+SUBFAILED[603, STRING_AGG(tbl.str_col)] tests/test_optimizer.py::TestOptimizer::test_annotate_funcs
+SUBFAILED[604, STRING_AGG(tbl.bin_col)] tests/test_optimizer.py::TestOptimizer::test_annotate_funcs
+SUBFAILED[605, STRING_AGG(DISTINCT tbl.str_col)] tests/test_optimizer.py::TestOptimizer::test_annotate_funcs
+SUBFAILED[606, STRING_AGG(tbl.str_col ORDER BY tbl.str_col)] tests/test_optimizer.py::TestOptimizer::test_annotate_funcs
+SUBFAILED[608, STRING_AGG(DISTINCT tbl.bin_col ORDER BY tbl.bin_col)] tests/test_optimizer.py::TestOptimizer::test_annotate_funcs
+SUBFAILED[612, STRING_AGG(DISTINCT tbl.bin_col ORDER BY tbl.bin_col LIMIT 10)] tests/test_optimizer.py::TestOptimizer::test_annotate_funcs
+17 failed, 1609 passed, 1 skipped, 25128 subtests passed in 169.30s (0:02:49)

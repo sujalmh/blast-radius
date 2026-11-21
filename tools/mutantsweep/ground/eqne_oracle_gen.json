@@ -1,0 +1,14 @@
+{
+  "id": "eqne_oracle_gen",
+  "patch": "corpus/eqne_oracle_gen.patch",
+  "failing": [
+    "tests/dialects/test_oracle.py::TestOracle::test_flashback"
+  ],
+  "passed": 1619,
+  "failed": 17,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 162.174,
+  "summary": "17 failed, 1619 passed, 1 skipped, 25419 subtests passed in 161.10s (0:02:41)"
+}

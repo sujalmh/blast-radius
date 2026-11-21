@@ -1,0 +1,14 @@
+{
+  "id": "fixture_identity_cast",
+  "patch": "corpus/fixture_identity_cast.patch",
+  "failing": [
+    "tests/test_transpile.py::TestTranspile::test_identity"
+  ],
+  "passed": 1620,
+  "failed": 1,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 104.567,
+  "summary": "1 failed, 1620 passed, 1 skipped, 25439 subtests passed in 103.68s (0:01:43)"
+}

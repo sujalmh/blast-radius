@@ -1,0 +1,35 @@
+................... [  1%]
+............................................................................................ [  6%]
+....................................... [  9%]
+........................................................................................................................................... [ 17%]
+......................... [ 19%]
+................................................................................................................................................................ [ 29%]
+.................. [ 30%]
+.................... [ 31%]
+.............................................................................................................................................................................. [ 42%]
+.....................................................................................................................................................................................s [ 53%]
+.............................................................................................................................. [ 61%]
+................................... [ 63%]
+................................................... [ 66%]
+.......................................................................... [ 71%]
+.............................................. [ 74%]
+........................................................................ [ 78%]
+..................................................................................... [ 83%]
+................................................................ [ 87%]
+..................................................................................................................................................................................... [ 98%]
+...................            [100%]
+=========================== short test summary info ============================
+SUBFAILED[REGEXP_EXTRACT_ALL('a1_a2a3_a4A5a6', '(a)[0-9]') -> spark] tests/dialects/test_bigquery.py::TestBigQuery::test_regexp_extract
+SUBFAILED[REGEXP_EXTRACT_ALL('a1_a2a3_a4A5a6', '(a)[0-9]') -> databricks] tests/dialects/test_bigquery.py::TestBigQuery::test_regexp_extract
+SUBFAILED[REGEXP_EXTRACT('abc', '(a)(b)(c)') -> presto] tests/dialects/test_hive.py::TestHive::test_hive
+SUBFAILED[REGEXP_EXTRACT('abc', '(a)(b)(c)') -> trino] tests/dialects/test_hive.py::TestHive::test_hive
+SUBFAILED[REGEXP_EXTRACT('abc', '(a)(b)(c)') -> duckdb] tests/dialects/test_hive.py::TestHive::test_hive
+SUBFAILED[hive -> REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1)] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[spark2 -> REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1)] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[spark -> REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1)] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[databricks -> REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1)] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1) -> hive] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1) -> spark2] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1) -> spark] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+SUBFAILED[REGEXP_SUBSTR(subject, pattern, 1, 1, 'c', 1) -> databricks] tests/dialects/test_snowflake.py::TestSnowflake::test_regexp_functions
+13 failed, 1620 passed, 1 skipped, 25427 subtests passed in 171.66s (0:02:51)

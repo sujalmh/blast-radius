@@ -27,7 +27,15 @@ tools/mutantsweep/
   corpus/<id>.patch     17 unified diffs against the pin (`a/`, `b/` labels)
   corpus/manifest.json  id / kind / group / file / line / summary / sha256
   ground/<id>.json      observed {failing[], passed, failed, skipped, wall_s}
+  logs/<id>.log         raw pytest log the ground truth was parsed from
+  audit.py              compare a selector output.jsonl against the ground truth
 ```
+
+Note on `failed` vs `failing`: pytest 9 counts unittest subtests separately, so
+one failing test method can report many "failed" entries and appears in the
+short summary as `SUBFAILED[<context>] tests/...::Test::test_x`.
+`ground/*.json` folds `FAILED`/`SUBFAILED`/`ERROR` lines into the deduped
+`failing` list of **test node ids**, which is the unit the scorer uses.
 
 ## Rerun
 
@@ -92,3 +100,41 @@ data point; patches that fail to apply are bugs and must be regenerated.
 selector's `workers` for the same patch: any id in `failing` that is not
 selected is a +300 s miss in the real scoring. `failing` is observed, not
 derived, so it is safe to use as an audit oracle.
+
+`audit.py` does that comparison and the score.py arithmetic for you:
+
+```bash
+python3 audit.py --output ../../output.jsonl --tests-json ../../sample/tests.json
+# id, selected count, failing count, misses, simulated cost, missed node ids
+```
+
+## Results (observed, pinned `eb11aec4`)
+
+Baseline: **1620 passed / 1 skipped** (`ground/baseline.json`). 14 of 17 mutants
+have at least one failing test; the two controls plus `andor_simplify` are harmless.
+All failing node ids exist in `sample/tests.json` (51 distinct ids across the corpus).
+
+| id | kind | file | failing tests | subtests failed | wall (s) |
+| --- | --- | --- | --- | --- | --- |
+| `andor_simplify` | and_or | `sqlglot/optimizer/simplify.py` | 0 | 0 | 162.5 |
+| `andor_bq_parser` | and_or | `sqlglot/parsers/bigquery.py` | 10 | 12 | 156.4 |
+| `eqne_oracle_gen` | eq_ne | `sqlglot/generators/oracle.py` | 1 | 17 | 162.2 |
+| `isnone_tsql_gen` | is_none | `sqlglot/generators/tsql.py` | 2 | 5 | 172.3 |
+| `classlit_hive_regexp_group` | class_literal | `sqlglot/dialects/hive.py` | 3 | 13 | 172.8 |
+| `classlit_duckdb_sample` | class_literal | `sqlglot/generators/duckdb.py` | 2 | 2 | 169.4 |
+| `classlit_typing_null` | class_literal | `sqlglot/typing/__init__.py` | 8 | 45 | 172.0 |
+| `argtypes_groupconcat` | arg_types | `sqlglot/expressions/aggregate.py` | 12 | 17 | 170.6 |
+| `tokenizer_oracle_neq` | tokenizer_table | `sqlglot/dialects/oracle.py` | 1 | 2 | 172.4 |
+| `parsertbl_presto_datediff` | parser_table | `sqlglot/parsers/presto.py` | 3 | 6 | 181.1 |
+| `optcond_optimize_joins` | optimizer_cond | `sqlglot/optimizer/optimize_joins.py` | 1 | 2 | 103.9 |
+| `optcond_pushdown_pos` | optimizer_cond | `sqlglot/optimizer/pushdown_predicates.py` | 5 | 133 | 79.6 |
+| `fixture_eliminate_joins` | fixture | `tests/fixtures/optimizer/eliminate_joins.sql` | 1 | 1 | 177.5 |
+| `fixture_qualify_columns` | fixture | `tests/fixtures/optimizer/qualify_columns.sql` | 1 | 1 | 180.0 |
+| `fixture_identity_cast` | fixture | `tests/fixtures/identity.sql` | 1 | 1 | 104.6 |
+| `control_comment_oracle` | comment | `sqlglot/generators/oracle.py` | 0 | 0 | 123.6 |
+| `control_enum_dialect` | enum_is | `sqlglot/dialects/dialect.py` | 0 | 0 | 123.5 |
+
+Wall times are the container-side pytest wall clock; the sweep was run 3-way
+parallel (`JOBS=3`), so concurrent runs are slower than a lone run (baseline ~85 s).
+`subtests failed` is pytest's own counter (pytest 9 counts unittest subtests
+separately); `failing tests` is the deduped node-id list in `ground/<id>.json`.

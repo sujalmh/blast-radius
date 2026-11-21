@@ -202,8 +202,8 @@ MUTANTS = [
         "line": 390,
         "op": "fixture_line",
         "old": "SELECT CAST(a AS INT) FROM test",
-        "new": "SELECT CAST(a AS VARCHAR) FROM test",
-        "summary": "identity fixture: CAST(a AS INT) -> CAST(a AS VARCHAR)",
+        "new": "SELECT CAST(a AS INT FROM test",
+        "summary": "identity fixture: drop the closing paren in CAST (parse-error edit)",
     },
     # g. controls
     {
