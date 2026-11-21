@@ -1456,7 +1456,15 @@ class Maps:
         return tuple(str(name) for name in self._symbols())
 
     def enum_index(self):
-        """Lazily built ``enum_neutral.EnumIndex`` over the pinned sources."""
+        """Lazily built ``enum_neutral.EnumIndex`` over the pinned sources.
+
+        Construction is cheap (no source is read or parsed here); the actual
+        index is filled on the first ``is_neutral`` call, which only happens for
+        a hunk that passed the ``enum_neutral.maybe_enum_flip`` text gate.  A
+        batch whose commits never flip an ``is``/``==`` spelling therefore never
+        builds (or even allocates the file list of) the index, and a batch that
+        does need it builds it at most once -- the instance is cached here.
+        """
         index = getattr(self, "_enum_index", None)
         if index is None:
             from .enum_neutral import EnumIndex

@@ -21,9 +21,13 @@ Deliberately **not** covered: ``x is None`` vs ``x == None``.  ``Expression``
 overrides ``__eq__`` with structural equality, so that flip is a real semantic
 change; leaving it selected is the correct conservatism.
 
-The index is built lazily -- only a hunk that actually contains an
-``is``/``==``-style op flip gets here -- and every parse/index/assignment scan
-is cached on the instance for the rest of the batch.
+The index is built lazily, and skipping it is nearly free: a hunk-level text
+prefilter (:func:`maybe_enum_flip`) only lets a file through when one of its
+``-``/``+`` line pairs is identical apart from an ``is``/``is not`` versus
+``==``/``!=`` spelling, so a commit that never touches a comparison never
+parses anything.  When a hunk does qualify, the index is built once per process
+and every parse/index/assignment scan is cached on the instance for the rest of
+the batch.
 """
 
 from __future__ import annotations
@@ -40,37 +44,56 @@ _FLIPS = frozenset({(ast.Is, ast.Eq), (ast.IsNot, ast.NotEq)})
 _MAX_PROOF_DEPTH = 6
 
 _CODING = re.compile(r"coding[:=]")
+_IS_NOT_TOKEN = re.compile(r"\bis\s+not\b")
 _IS_TOKEN = re.compile(r"\bis\b")
-_EQ_TOKEN = re.compile(r"==|!=")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _folded(line: str) -> str:
+    """``line`` with ``is not``/``is`` folded onto ``!=``/``==``, no whitespace.
+
+    Only line *pairing* uses this: two lines that fold onto the same text can
+    differ in nothing but the operator spelling.
+    """
+    folded = _IS_NOT_TOKEN.sub("!=", line)
+    folded = _IS_TOKEN.sub("==", folded)
+    return _WHITESPACE.sub("", folded)
 
 
 def maybe_enum_flip(file_patch: FilePatch) -> bool:
-    """Cheap textual gate: the hunk flips an ``is`` spelling into ``==``/``!=``.
+    """Cheap textual gate: some ``-``/``+`` pair differs only by an op flip.
 
-    Pinned/patched parsing is only worth it when both spellings appear on
-    opposite sides of the hunk; a commit with no comparison edit at all skips
-    the whole enum path.
+    The whole enum path (two source parses, then -- behind them -- the pinned
+    enum index) is only worth paying for when a removed line and an added line
+    of the *same* hunk are character-for-character identical once whitespace is
+    dropped and ``is not``/``is`` are folded onto ``!=``/``==``.  That is the
+    exact footprint of an operator-only edit, so the overwhelming majority of
+    hunks (any commit that never touches a comparison) stop here and never
+    build the index.
+
+    The gate is deliberately one-sided: a flip spelled differently (operands
+    re-wrapped or parenthesised across lines) pairs with nothing and the file
+    is treated as an ordinary edit.  That costs a few extra selected tests, but
+    it can never drop one.
     """
-    removed: list[str] = []
-    added: list[str] = []
     for hunk in file_patch.hunks:
-        removed.extend(hunk.removed)
-        added.extend(hunk.added)
-    removed_text = "\n".join(removed)
-    added_text = "\n".join(added)
-    has_is = bool(_IS_TOKEN.search(removed_text)) or bool(
-        _IS_TOKEN.search(added_text)
-    )
-    has_eq = bool(_EQ_TOKEN.search(removed_text)) or bool(
-        _EQ_TOKEN.search(added_text)
-    )
-    if not (has_is and has_eq):
-        return False
-    removed_is = bool(_IS_TOKEN.search(removed_text))
-    added_is = bool(_IS_TOKEN.search(added_text))
-    removed_eq = bool(_EQ_TOKEN.search(removed_text))
-    added_eq = bool(_EQ_TOKEN.search(added_text))
-    return (removed_is and added_eq) or (removed_eq and added_is)
+        added = hunk.added
+        removed = hunk.removed
+        if not added or not removed:
+            continue
+        # ``folded text -> the whitespace-free texts that fold onto it``.  Hunks
+        # are small, so this keeps the scan linear in the hunk's size.
+        pairs: dict[str, set[str]] = {}
+        for line in added:
+            pairs.setdefault(_folded(line), set()).add(_WHITESPACE.sub("", line))
+        for line in removed:
+            candidates = pairs.get(_folded(line))
+            if not candidates:
+                continue
+            plain = _WHITESPACE.sub("", line)
+            if any(other != plain for other in candidates):
+                return True
+    return False
 
 
 def _module_of(path: str) -> str:

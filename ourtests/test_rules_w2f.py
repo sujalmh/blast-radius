@@ -13,7 +13,7 @@ import json
 import pytest
 
 from blastradius.bench_adapter import bench_adapter
-from blastradius.enum_neutral import EnumIndex
+from blastradius.enum_neutral import EnumIndex, maybe_enum_flip
 from blastradius.maps_io import Maps
 from blastradius.patch import parse_patch
 from blastradius.select import Knobs, TestIndex, select_commit
@@ -138,6 +138,24 @@ def test_enum_neutrality_knob_off_keeps_the_selection(loaded):
     maps, index = loaded
     selection, _ = _select("enum-neutral-flip", maps, index, Knobs(enum_neutral="off"))
     assert selection.tier != "neutral"
+    assert "neutral" not in _rules(selection)
+
+
+def test_patch_without_a_comparison_flip_never_touches_the_enum_index(
+    loaded, monkeypatch
+):
+    """W2g: the hunk text gate keeps the whole pinned-source index unbuilt."""
+    maps, index = loaded
+    patch = mockmaps.PATCHES["code-alpha"]
+    (file_patch,) = parse_patch(patch)
+    assert not maybe_enum_flip(file_patch)  # no is/== pair at all
+
+    def _unbuilt():
+        raise AssertionError("enum index built for a patch with no is/== flip")
+
+    monkeypatch.setattr(maps, "enum_index", _unbuilt)
+    selection, numbers = _select("code-alpha", maps, index)
+    assert numbers == {0}
     assert "neutral" not in _rules(selection)
 
 
