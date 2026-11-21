@@ -157,6 +157,13 @@ class Engine:
 
         for change in changes:
             kind = partition(change.path)
+            # A provably comment-only, AST-identical sqlglot .py file inside a
+            # mixed commit cannot break anything: skip it like blastradius does.
+            if kind == "sqlglot" and change.is_python and not change.is_new and not change.is_deleted:
+                file_neutral, file_note = self._is_neutral([change])
+                if file_neutral is True:
+                    selection.notes.append(f"harmless file in mixed commit: {change.path}")
+                    continue
             if kind == "sqlglot":
                 self._source_change(change, selection)
             elif kind == "testpy":
