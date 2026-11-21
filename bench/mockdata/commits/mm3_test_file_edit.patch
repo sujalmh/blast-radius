@@ -1,0 +1,8 @@
+diff --git a/tests/test_parser.py b/tests/test_parser.py
+index 0000000..3333333 100644
+--- a/tests/test_parser.py
++++ b/tests/test_parser.py
+@@ -10,2 +10,3 @@ class TestParser(unittest.TestCase):
+     def test_union(self):
+         self.assertEqual(self.validate_identity("SELECT 1"), "SELECT 1")
++        self.assertTrue(True)

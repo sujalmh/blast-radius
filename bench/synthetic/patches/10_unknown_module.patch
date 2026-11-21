@@ -1,0 +1,14 @@
+diff --git a/sqlglot/planner.py b/sqlglot/planner.py
+index cdf8bbd..81456a1 100644
+--- a/sqlglot/planner.py
++++ b/sqlglot/planner.py
+@@ -11,7 +11,8 @@ from collections.abc import Iterator, Sequence, Iterable
+ 
+ 
+ class Plan:
+-    def __init__(self, expression: exp.Expr) -> None:
++    def __init__(self, expression: exp.Expr) -> None:  # bench probe
++
+         self.expression: exp.Expr = expression.copy()
+         with_: exp.With | None = self.expression.args.get("with_")
+         self.ctes: exp.With | None = with_.copy() if with_ is not None else None

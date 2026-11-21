@@ -1,0 +1,77 @@
+{
+ "tests": [
+  {
+   "number": 0,
+   "id": "tests/test_mock_parser.py::TestMockParser::test_a",
+   "file": "tests/test_mock_parser.py",
+   "seconds": 0.12
+  },
+  {
+   "number": 1,
+   "id": "tests/test_mock_parser.py::TestMockParser::test_b",
+   "file": "tests/test_mock_parser.py",
+   "seconds": 0.08
+  },
+  {
+   "number": 2,
+   "id": "tests/test_mock_optimizer.py::TestMockOptimizer::test_a",
+   "file": "tests/test_mock_optimizer.py",
+   "seconds": 0.3
+  },
+  {
+   "number": 3,
+   "id": "tests/test_mock_optimizer.py::TestMockOptimizer::test_b",
+   "file": "tests/test_mock_optimizer.py",
+   "seconds": 0.05
+  },
+  {
+   "number": 4,
+   "id": "tests/test_mock_helper.py::TestMockHelper::test_dates",
+   "file": "tests/test_mock_helper.py",
+   "seconds": 0.2
+  },
+  {
+   "number": 5,
+   "id": "tests/test_mock_helper.py::TestMockHelper::test_units",
+   "file": "tests/test_mock_helper.py",
+   "seconds": 0.07
+  },
+  {
+   "number": 6,
+   "id": "tests/test_mock_sqlite.py::TestMockSQLite::test_generate",
+   "file": "tests/test_mock_sqlite.py",
+   "seconds": 0.15
+  },
+  {
+   "number": 7,
+   "id": "tests/test_mock_sqlite.py::TestMockSQLite::test_roundtrip",
+   "file": "tests/test_mock_sqlite.py",
+   "seconds": 0.04
+  },
+  {
+   "number": 8,
+   "id": "tests/test_mock_bigquery.py::TestMockBigQuery::test_parse",
+   "file": "tests/test_mock_bigquery.py",
+   "seconds": 0.11
+  },
+  {
+   "number": 9,
+   "id": "tests/test_mock_bigquery.py::TestMockBigQuery::test_qualify",
+   "file": "tests/test_mock_bigquery.py",
+   "seconds": 0.06
+  },
+  {
+   "number": 10,
+   "id": "tests/dialects/test_mock_dialect.py::TestMockDialect::test_x",
+   "file": "tests/dialects/test_mock_dialect.py",
+   "seconds": 0.03
+  },
+  {
+   "number": 11,
+   "id": "tests/dialects/test_mock_dialect.py::TestMockDialect::test_y",
+   "file": "tests/dialects/test_mock_dialect.py",
+   "seconds": 0.025
+  }
+ ],
+ "skipped": []
+}

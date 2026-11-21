@@ -1,0 +1,165 @@
+{
+ "note": "Qualitative expectations only (structure, Tier E, which rule fired), never exact failing-test sets. `expect` applies to any conforming map set; `mock`/`real` overrides are merged on top depending on the map set in use (bench/mockmaps/MANIFEST.json says source=mock). Patches were generated against pinned sqlglot eb11aec4be8cb2122afe713a4816662c3f0fb2fa.",
+ "checks": [
+  {
+   "id": "parser_function",
+   "patch": "patches/01_parser_function.patch",
+   "why": "one-line boolean change inside BigQueryParser._parse_table_qualified_name-ish method body: a parser-heavy change must select parser tests, never Tier E",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": false,
+      "empty": false,
+      "min_selected": 1,
+      "rules_include": ["symbol"]
+     },
+     "real": {
+      "patterns": ["tests/dialects/test_bigquery\\.py::", "tests/test_parser\\.py::"],
+      "min_pattern_matches": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "module_constant",
+   "patch": "patches/02_module_constant.patch",
+   "why": "DATE_UNITS is assigned at module level in sqlglot/helper.py; no test covers the assignment line, so only the class-body/usage rules can catch it",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": false,
+      "empty": false,
+      "min_selected": 1,
+      "rules_include": ["classbody", "usage"]
+     },
+     "mock": {
+      "max_selected": 12
+     }
+    }
+   ]
+  },
+  {
+   "id": "class_body_attribute",
+   "patch": "patches/03_class_body_attribute.patch",
+   "why": "class-body attribute change in SQLiteGenerator: class-body rule must fire",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": false,
+      "empty": false,
+      "min_selected": 1,
+      "rules_include": ["classbody"]
+     }
+    }
+   ]
+  },
+  {
+   "id": "new_source_file",
+   "patch": "patches/04_new_source_file.patch",
+   "why": "brand-new sqlglot module: pure addition, nothing to run",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": false,
+      "empty": true
+     }
+    }
+   ]
+  },
+  {
+   "id": "fixture_known",
+   "patch": "patches/05_fixture_known.patch",
+   "why": "a known optimizer fixture: exactly the fixture map's tests, no Tier E",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": false,
+      "empty": false,
+      "min_selected": 1,
+      "rules_exactly": ["fixture"]
+     }
+    }
+   ]
+  },
+  {
+   "id": "comment_only",
+   "patch": "patches/06_comment_only.patch",
+   "why": "comment-only insert in sqlglot/trie.py: neutral with --neutral on, a normal symbol change with it off",
+   "checks": [
+    {
+     "knobs": {"neutral": true},
+     "expect": {
+      "tier_e": false,
+      "empty": true
+     }
+    },
+    {
+     "knobs": {"neutral": false},
+     "expect": {
+      "tier_e": false,
+      "empty": false,
+      "rules_include": ["symbol"]
+     }
+    }
+   ]
+  },
+  {
+   "id": "shared_helper",
+   "patch": "patches/07_shared_helper.patch",
+   "why": "tests/helpers.py is imported by many test files (`__shared__`): Tier E",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": true,
+      "empty": false
+     }
+    }
+   ]
+  },
+  {
+   "id": "test_file_edit",
+   "patch": "patches/08_test_file_edit.patch",
+   "why": "editing tests/test_parser.py selects exactly its own tests (test-file map)",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": false,
+      "empty": false,
+      "min_selected": 1,
+      "rules_exactly": ["testpy"]
+     }
+    }
+   ]
+  },
+  {
+   "id": "unknown_fixture",
+   "patch": "patches/09_unknown_fixture.patch",
+   "why": "fixture not in the fixture map: unknown shape -> Tier E",
+   "checks": [
+    {
+     "expect": {
+      "tier_e": true,
+      "empty": false
+     }
+    }
+   ]
+  },
+  {
+   "id": "unknown_module",
+   "patch": "patches/10_unknown_module.patch",
+   "why": "in the mock world sqlglot/planner.py is deliberately absent from the maps (unknown source file -> Tier E); against real maps it is a known file and must not be Tier E",
+   "checks": [
+    {
+     "expect": {},
+     "mock": {
+      "tier_e": true,
+      "empty": false
+     },
+     "real": {
+      "tier_e": false
+     }
+    }
+   ]
+  }
+ ]
+}

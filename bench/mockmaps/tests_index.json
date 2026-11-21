@@ -1,0 +1,16 @@
+{
+ "test_ids": [
+  "tests/test_mock_parser.py::TestMockParser::test_a",
+  "tests/test_mock_parser.py::TestMockParser::test_b",
+  "tests/test_mock_optimizer.py::TestMockOptimizer::test_a",
+  "tests/test_mock_optimizer.py::TestMockOptimizer::test_b",
+  "tests/test_mock_helper.py::TestMockHelper::test_dates",
+  "tests/test_mock_helper.py::TestMockHelper::test_units",
+  "tests/test_mock_sqlite.py::TestMockSQLite::test_generate",
+  "tests/test_mock_sqlite.py::TestMockSQLite::test_roundtrip",
+  "tests/test_mock_bigquery.py::TestMockBigQuery::test_parse",
+  "tests/test_mock_bigquery.py::TestMockBigQuery::test_qualify",
+  "tests/dialects/test_mock_dialect.py::TestMockDialect::test_x",
+  "tests/dialects/test_mock_dialect.py::TestMockDialect::test_y"
+ ]
+}

@@ -1,0 +1,13 @@
+diff --git a/sqlglot/trie.py b/sqlglot/trie.py
+index 3b99d14..026a57e 100644
+--- a/sqlglot/trie.py
++++ b/sqlglot/trie.py
+@@ -31,6 +31,8 @@ def new_trie(keywords: Iterable[key], trie: t.Optional[dict] = None) -> dict:
+     """
+     trie = {} if trie is None else trie
+ 
++    # bench probe: comment only, must be neutral
++
+     for key in keywords:
+         current = trie
+         for char in key:

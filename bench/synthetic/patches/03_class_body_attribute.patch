@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generators/sqlite.py b/sqlglot/generators/sqlite.py
+index b46c7ae..63f3c97 100644
+--- a/sqlglot/generators/sqlite.py
++++ b/sqlglot/generators/sqlite.py
+@@ -92,7 +92,7 @@ class SQLiteGenerator(generator.Generator):
+     AFTER_HAVING_MODIFIER_TRANSFORMS = generator.AFTER_HAVING_MODIFIER_TRANSFORMS
+ 
+     JOIN_HINTS = False
+-    TABLE_HINTS = False
++    TABLE_HINTS = True
+     QUERY_HINTS = False
+     NVL2_SUPPORTED = False
+     JSON_PATH_BRACKETED_KEY_SUPPORTED = False

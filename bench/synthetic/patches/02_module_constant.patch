@@ -1,0 +1,13 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+index 3976bde..080f17d 100644
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -463,7 +463,7 @@ def is_iso_datetime(text: str) -> bool:
+ 
+ 
+ # Interval units that operate on date components
+-DATE_UNITS = {"day", "week", "month", "quarter", "year", "year_month"}
++DATE_UNITS = {"day", "week", "month", "quarter", "year", "year_month", "decade"}
+ 
+ 
+ def is_date_unit(expression: Expr | None) -> bool:

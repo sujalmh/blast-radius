@@ -1,0 +1,12 @@
+diff --git a/tests/test_parser.py b/tests/test_parser.py
+index b2dd023..62d39bc 100644
+--- a/tests/test_parser.py
++++ b/tests/test_parser.py
+@@ -10,6 +10,7 @@ from tests.helpers import assert_logger_contains
+ 
+ 
+ class TestParser(unittest.TestCase):
++    PROBE_MARKER = True
+     def test_conditionless_join(self):
+         self.assertEqual(parse_one("JOIN b", into=exp.Join).sql(), "CROSS JOIN b")
+         self.assertEqual(

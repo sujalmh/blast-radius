@@ -1,0 +1,28 @@
+{
+ "commits": {
+  "mm1_helper_const": {
+   "failing": [
+    4
+   ],
+   "kind": "code"
+  },
+  "mm2_fixture_change": {
+   "failing": [
+    2
+   ],
+   "kind": "fixture"
+  },
+  "mm3_test_file_edit": {
+   "failing": [
+    1
+   ],
+   "kind": "code"
+  },
+  "mm4_unknown_module": {
+   "failing": [
+    3
+   ],
+   "kind": "code"
+  }
+ }
+}

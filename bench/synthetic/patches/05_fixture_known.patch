@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/pushdown_predicates.sql b/tests/fixtures/optimizer/pushdown_predicates.sql
+index bc2f0ec..3da46ed 100644
+--- a/tests/fixtures/optimizer/pushdown_predicates.sql
++++ b/tests/fixtures/optimizer/pushdown_predicates.sql
+@@ -138,7 +138,7 @@ SELECT x.a, y.b FROM x FULL JOIN y ON x.a = y.b WHERE y.b = 3;
+ SELECT x.a, y.b FROM x FULL JOIN y ON x.a = y.b WHERE y.b = 3;
+ 
+ -- That covers anything joined before the FULL JOIN too, not just the FROM source
+-SELECT x.a, z.b FROM x JOIN z ON x.b = z.b FULL JOIN y ON x.b = y.b WHERE z.b = 3;
++SELECT x.a, z.b FROM x JOIN z ON x.b = z.b FULL JOIN y ON x.b = y.b WHERE z.b = 4;
+ SELECT x.a, z.b FROM x JOIN z ON x.b = z.b FULL JOIN y ON x.b = y.b WHERE z.b = 3;
+ 
+ SELECT x.a, z.b FROM x JOIN (SELECT b FROM z) AS z ON x.b = z.b FULL JOIN y ON x.b = y.b WHERE z.b = 3;

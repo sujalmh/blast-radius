@@ -1,0 +1,18 @@
+{
+ "source": "mock",
+ "pinned_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+ "generator": "bench/mockmaps/build.py",
+ "note": "Hand-authored fiction: coverage/usage/fixture/test-file maps are invented and describe no real patch. source.tar.gz holds pinned sqlglot files only so the neutrality and EOF checks can run before real maps land.",
+ "source_files": [
+  "sqlglot/helper.py",
+  "sqlglot/trie.py",
+  "sqlglot/generators/sqlite.py",
+  "sqlglot/parsers/bigquery.py"
+ ],
+ "source_sha1": {
+  "sqlglot/generators/sqlite.py": "1858e9bf6d876b802790f54c75aacfe02639297d",
+  "sqlglot/helper.py": "3c03795f35386bcf8c3a64d2cb0c4213a65b878c",
+  "sqlglot/parsers/bigquery.py": "56983911bc8db5bcec94405921093c44d0396e67",
+  "sqlglot/trie.py": "e0286036139b7ec16fbe76752fa96cf0e408d8b2"
+ }
+}

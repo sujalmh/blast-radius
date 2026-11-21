@@ -1,0 +1,9 @@
+diff --git a/tests/fixtures/optimizer/pushdown_predicates.sql b/tests/fixtures/optimizer/pushdown_predicates.sql
+index 0000000..2222222 100644
+--- a/tests/fixtures/optimizer/pushdown_predicates.sql
++++ b/tests/fixtures/optimizer/pushdown_predicates.sql
+@@ -140,3 +140,3 @@
+ SELECT x.a FROM x
+-SELECT 1
++SELECT 2
+ SELECT 3

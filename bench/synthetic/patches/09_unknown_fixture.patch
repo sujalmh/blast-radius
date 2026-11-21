@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/identity.sql b/tests/fixtures/identity.sql
+index 94f79f2..fce3d95 100644
+--- a/tests/fixtures/identity.sql
++++ b/tests/fixtures/identity.sql
+@@ -217,7 +217,7 @@ SELECT *, 1 FROM test
+ SELECT * FROM a.b
+ SELECT * FROM a.b.c
+ SELECT * FROM table
+-SELECT 1
++SELECT 2
+ SELECT 1 FROM test
+ SELECT * FROM a, b, (SELECT 1) AS c
+ SELECT a FROM test

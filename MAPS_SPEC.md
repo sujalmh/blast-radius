@@ -53,6 +53,11 @@ Selection rules (v1, pure functions of the above maps — no patch-specific stat
   lines (verified: reconstruct the patched file in memory, `ast.parse` both pinned and patched,
   compare `ast.dump`; reject if a coding declaration `coding[:=]` appears in the first two
   lines) → output `[]`. Sample ground truth: comment-only commits break nothing.
+  **Neutrality applies only to `.py` files with pinned source** (a `.py` without pinned
+  bytes, e.g. under tests/, is not neutral — its normal rules apply) and to non-test assets
+  (docs, README). A non-.py file under `tests/` is NEVER neutral: sqlglot fixtures treat
+  `# title:` / `# dialect:` / `# execute:` lines as directives, so a comment-only fixture
+  edit can change behaviour and must select its readers instead.
 - `FIXTURE` file → tests that read it (fixture map). The fixture map records ALL files under
   the checkout that tests read, including non-test .py files (e.g. tests/fixtures/**.py) — a
   tests/**.py that defines no numbered tests is treated as a fixture, not a test file.

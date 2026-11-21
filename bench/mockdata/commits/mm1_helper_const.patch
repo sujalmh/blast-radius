@@ -1,0 +1,11 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+index 0000000..1111111 100644
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -464,5 +464,5 @@
+ 
+ # Interval units that operate on date components
+-DATE_UNITS = {"day", "week", "month", "quarter", "year", "year_month"}
++DATE_UNITS = {"day", "week", "month", "quarter", "year", "year_month", "decade"}
+ 
+ 
