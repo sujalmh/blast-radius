@@ -145,6 +145,40 @@ coverage contexts; fixture reads via a conftest plugin that wraps open and recor
 per-test paths. Acceptance for W1 plumbing test: run the whole pipeline on ONE small test
 file (e.g. `tests/dialects/test_dune.py`) and produce valid maps for it in minutes.
 
+## Mapgen v2 requirements (root causes found in calibration, 2026-11-22)
+
+Two capture bugs cost the sample 4 misses (+1200 s) and ~130 s of over-selection:
+
+1. **Subprocess coverage gap.** `tests/test_optimizer.py` (line 111) and
+   `tests/test_executor.py` run every fixture-driven case in a
+   `ProcessPoolExecutor(mp_context=get_context("spawn"))`. Per-test coverage contexts in the
+   parent never see child-process execution, so every `check_file`-style test
+   (test_tpcds, test_tpch, test_simplify, test_optimize, test_eliminate_joins,
+   test_execute_tpcds, …) shows only import-attribution lines in the map, and mutations whose
+   failing tests are fixture-driven (2jrq, 3utz, ary6, rszg, 535z) are missed.
+   Fix: measure children — `COVERAGE_PROCESS_START` + a `.pth`/sitecustomize hook calling
+   `coverage.process_startup()`, `[run] parallel = true`, per-task context attribution: wrap
+   `ProcessPoolExecutor.submit` in the parent (module-level picklable `_task(test_id, fn,
+   *args, **kwargs)` in trace_conftest; the child does `Coverage.current().switch_context(
+   test_id)` then `save()`), then `coverage combine` before gen_maps. Same treatment applies
+   to every other trace (fixture reads are parent-side and unaffected; dialect exposure and
+   dict-key reads happen INSIDE child tasks for fixture-driven tests, so those traces must be
+   installed at import time in every process via the same sitecustomize hook, guarded by an
+   env var set only during the traced run).
+2. **usage_refs scan misses Attribute references.** `maps/usage_refs.json.gz` only matched
+   `Name.id`, so `dialect.WEEK_OFFSET` / `self.dialect.WEEK_OFFSET` reads (the real failure
+   path of 535z: sqlglot/optimizer/simplify.py:545,561, generator.py:6768) are absent, and the
+   usage rule fired on definition-line noise instead. Fix: scan every sqlglot file for both
+   `Name.id == NAME` and `Attribute.attr == NAME`, and EXCLUDE the definition's own line from
+   each name's reference set (definition lines execute at import and only add
+   first-importer noise).
+
+Verified facts behind these (diagnostics in container `blast-mapgen`): a direct
+`eliminate_joins(parse_one("SELECT x.a FROM x CROSS JOIN (SELECT 1 AS b OFFSET 1) AS y"))`
+traces lines 54 and 62-74 incl. the mutated line 71, while the traced-suite map attributes
+none of them to any check_file test; applying the 2jrq/535z mutations reproduces the answers'
+failing sets exactly (test_eliminate_joins 12 subtest failures, test_simplify 4, etc.).
+
 ## Non-negotiables
 
 - selector.py: stdlib only, stdout = answer lines only, all logs to stderr, never crash on a
