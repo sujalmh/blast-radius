@@ -242,14 +242,15 @@ def test_dialect_family_keeps_a_parameter_receiver_reader(loaded):
     """535z soundness: the failing test reads WEEK_OFFSET via a param receiver.
 
     ``dialect.WEEK_OFFSET`` in optimizer/simplify.py is an ``instance_lines``
-    read, so L4 must *not* rely on it -- the dialect-path universe K (tests
-    exposed to ``beam``) is what keeps test_extra (4) selected, while test_delta
-    (5), which covers the very same line but is not beam-exposed, is dropped.
+    read, so L4 must *not* rely on it alone -- the test survives because the
+    dialect-K intersection only keeps exposure-universe tests that also execute
+    a reader line, and test_extra is one.  test_delta (5) covers the very same
+    line but is not beam-exposed, so it is dropped.
     """
     maps, index = loaded
     attr_ids = maps.classattr_tests("sqlglot/dialects/beam.py", "Beam", "WEEK_OFFSET")
     assert attr_ids is not None
-    assert "tests/test_other.py::test_extra" in attr_ids  # only via exposure
+    assert "tests/test_other.py::test_extra" in attr_ids  # reader ∩ exposure
     assert "tests/test_mod.py::test_delta" not in attr_ids
     assert "beam" in mockmaps.DIALECTS["exposure"]["tests/test_other.py::test_extra"]
     assert "beam" not in mockmaps.DIALECTS["exposure"]["tests/test_mod.py::test_delta"]

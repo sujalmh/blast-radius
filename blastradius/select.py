@@ -22,6 +22,19 @@ dialect classes, and UNKNOWN otherwise -- in which case ``self_lines`` and
 ``instance_lines`` stay in the union (Tokenizer/Parser/Generator instance
 creation is not traced).  Unresolvable classes keep L1; a missing/partial
 ``classes.json.gz`` disables the rule with a warning.
+
+Three W2f refinements sit on top:
+
+* **enum neutrality** (``Knobs.enum_neutral``): a hunk whose only semantic
+  change flips ``is``/``==`` between two proven members of the same sqlglot
+  ``Enum`` is neutral, exactly like a comment-only hunk (``enum_neutral.py``);
+* **dialect-K intersection** (``Knobs.dialect_k``): the dialect family universe
+  is intersected with the attr readers / class-span coverers, so a merely
+  dialect-exposed test that never executes the attribute cannot be selected;
+* **line-biased symbols** (``Knobs.line_bias``): a method hunk whose changed
+  lines are inside one body narrows to the tests covering those exact lines
+  (``+/-1`` pad) intersected with the symbol-span tests; signature, insertion,
+  deleted-statement-head and empty-coverage shapes fall back to the span.
 """
 
 from __future__ import annotations
@@ -30,7 +43,7 @@ import ast
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
-from . import neutral
+from . import enum_neutral, neutral
 from .maps_io import Maps, Symbol
 from .patch import FilePatch, Hunk
 
@@ -58,6 +71,9 @@ class Knobs:
     dialect: str = "on"  # "on" | "off"
     keyreads: str = "on"  # "on" | "off"
     l4: str = "on"  # "on" | "off"  (class-attribute narrowing)
+    enum_neutral: str = "on"  # "on" | "off"  (is<->== enum-member neutrality)
+    dialect_k: str = "intersect"  # "intersect" | "union"  (L4 dialect universe)
+    line_bias: str = "on"  # "on" | "off"  (method-hunk line subsetting)
 
     def normalized(self) -> "Knobs":
         symbol = self.symbol if self.symbol in ("innermost", "all") else "innermost"
@@ -69,7 +85,16 @@ class Knobs:
         dialect = "off" if self.dialect is False or self.dialect == "off" else "on"
         keyreads = "off" if self.keyreads is False or self.keyreads == "off" else "on"
         l4 = "off" if self.l4 is False or self.l4 == "off" else "on"
-        return Knobs(symbol, classbody, dialect, keyreads, l4)
+        enum_neutral = (
+            "off"
+            if self.enum_neutral is False or self.enum_neutral == "off"
+            else "on"
+        )
+        dialect_k = "union" if self.dialect_k in (False, "union") else "intersect"
+        line_bias = "off" if self.line_bias is False or self.line_bias == "off" else "on"
+        return Knobs(
+            symbol, classbody, dialect, keyreads, l4, enum_neutral, dialect_k, line_bias
+        )
 
 
 DEFAULT_KNOBS = Knobs()
@@ -183,21 +208,26 @@ def _tier_e(index: TestIndex, reason: str) -> Selection:
     return Selection(set(index.all_ids), [RuleHit("tier_e", detail=reason)], "tier_e")
 
 
-def _file_is_neutral(file_patch: FilePatch, maps: Maps) -> bool:
-    """Per-file neutrality (used to skip a harmless file in a mixed commit)."""
-    if not neutral.changed_lines_only_comments(file_patch):
-        return False
+def _file_is_neutral(file_patch: FilePatch, maps: Maps, knobs: Knobs) -> bool:
+    """Per-file neutrality: comment-only, or an enum-member ``is``/``==`` flip."""
     path = file_patch.path
     if path is None:
         return False
+    comment_only = neutral.changed_lines_only_comments(file_patch)
     if not path.endswith(".py"):
-        return neutral.non_python_change_is_harmless(path)
+        return comment_only and neutral.non_python_change_is_harmless(path)
     if file_patch.is_new or file_patch.is_deleted:
         return False
     text = maps.source_text(path)
     if text is None:
         return False
-    return neutral.is_neutral_file(text, file_patch)
+    if comment_only and neutral.is_neutral_file(text, file_patch):
+        return True
+    if knobs.enum_neutral != "on":
+        return False
+    if not enum_neutral.maybe_enum_flip(file_patch):
+        return False
+    return maps.enum_index().is_neutral(text, file_patch, path)
 
 
 def _removed_lines(hunk: Hunk) -> list[int]:
@@ -243,6 +273,113 @@ def _module_of(path: str) -> str:
     if parts and parts[-1] == "__init__":
         parts.pop()
     return ".".join(parts)
+
+
+_SIGNATURE_PREFIXES = ("@", "def ", "async def ", "class ")
+
+
+def _unbalanced_brackets(text: str) -> bool:
+    """True when ``text`` leaves a bracket/quote open (ignoring a ``#`` tail)."""
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for char in text:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+            continue
+        if char == "#":
+            break
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0 or quote is not None
+
+
+def _multiline_statement_head(text: str) -> bool:
+    """Signature/decorator line, or a statement head that continues below."""
+    snippet = text.strip()
+    if not snippet:
+        return False
+    if snippet.startswith(_SIGNATURE_PREFIXES):
+        return True
+    if snippet.endswith((":", "\\")):
+        return True
+    return _unbalanced_brackets(snippet)
+
+
+def _function_body_starts(tree: ast.AST) -> dict[int, int]:
+    """``def`` line -> first body-statement line, for every function in a file."""
+    starts: dict[int, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            starts.setdefault(node.lineno, node.body[0].lineno)
+    return starts
+
+
+def _line_bias_target(
+    hunk: Hunk,
+    symbols: Sequence[Symbol],
+    removed_by_line: dict[int, str],
+    added_texts: Sequence[str],
+    body_starts: dict[int, int],
+) -> tuple[Symbol, tuple[int, ...]] | None:
+    """The innermost function a hunk can be narrowed to, or ``None`` (fallback).
+
+    Every fallback is deliberate and recall-safe: a pure insertion, a
+    def/signature/decorator edit, a changed line outside the body, a *deleted*
+    multi-line statement head (``if x:`` / open brackets, whose body may no
+    longer be reached by the pre-patch coverage), or changed lines that do not
+    all sit in one innermost function.
+
+    A *rewritten* statement head (``if a:`` -> ``if b:``) is not a deletion: a
+    test that can observe the new body must have executed the very head line we
+    narrow to, so it stays line-biased.
+    """
+    if hunk.old_count == 0 or not removed_by_line:
+        return None
+    changed = sorted(removed_by_line)
+    enclosing: list[Symbol] = []
+    for line in changed:
+        symbol = _innermost(symbols, line)
+        if symbol is None or symbol.kind != "function":
+            return None
+        enclosing.append(symbol)
+    target = enclosing[0]
+    if any(
+        symbol.qualname != target.qualname or symbol.span != target.span
+        for symbol in enclosing[1:]
+    ):
+        return None
+    body_start = body_starts.get(target.start)
+    if body_start is None:
+        return None  # symbols and pinned AST disagree: stay conservative
+    removed_heads = 0
+    for line in changed:
+        if line < body_start:
+            return None  # def / decorator / multi-line signature line
+        text = removed_by_line[line]
+        if text.strip().startswith(_SIGNATURE_PREFIXES):
+            return None
+        if _multiline_statement_head(text):
+            removed_heads += 1
+    added_heads = sum(
+        1 for text in added_texts if _multiline_statement_head(text)
+    )
+    if removed_heads > added_heads:
+        return None  # a multi-line statement head was deleted, not rewritten
+    return target, tuple(changed)
+
 
 
 def _dialect_scope(
@@ -384,6 +521,7 @@ def _classattr_ids(
     path: str,
     name: str,
     lines: Iterable[int],
+    dialect_k: str = "intersect",
 ) -> tuple[set[str], str] | None:
     """L4: sound narrowing for a class-body attribute assignment of ``name``.
 
@@ -399,7 +537,7 @@ def _classattr_ids(
         if not classes:
             return None  # module-level: not a class attribute
         qualname = classes[0].qualname
-        ids = maps.classattr_tests(path, qualname, name)
+        ids = maps.classattr_tests(path, qualname, name, dialect_k=dialect_k)
         if ids is None:
             return None
         family, key = maps.class_family(path, qualname)
@@ -428,10 +566,18 @@ def _apply_sqlglot(
 
     file_len = maps.file_length(path)
     ranges: list[tuple[int, int]] = []
+    biased: list[tuple[tuple[int, int], tuple[int, ...]]] = []
     broad_lines: set[int] = set()
     module_lines: set[int] = set()
     hunk_lines: list[int] = []
     removed: list[tuple[int, str]] = []
+    source_text = maps.source_text(path) if knobs.line_bias == "on" else None
+    body_starts: dict[int, int] | None = None
+    if source_text is not None:
+        try:
+            body_starts = _function_body_starts(ast.parse(source_text))
+        except (SyntaxError, ValueError):
+            body_starts = None
 
     for hunk in file_patch.hunks:
         if file_len is not None:
@@ -443,7 +589,16 @@ def _apply_sqlglot(
                 return False
         old_lines = hunk.old_lines(file_len)
         hunk_lines.extend(old_lines)
-        removed.extend(_removed_texts(hunk))
+        removed_texts = _removed_texts(hunk)
+        removed.extend(removed_texts)
+        bias = (
+            _line_bias_target(
+                hunk, symbols, dict(removed_texts), hunk.added, body_starts
+            )
+            if body_starts is not None
+            else None
+        )
+        bias_added = False
         for line in old_lines:
             symbol = _innermost(symbols, line)
             if symbol is not None and symbol.kind == "function":
@@ -455,6 +610,14 @@ def _apply_sqlglot(
                 if whole_file:
                     broad_lines.add(line)
                     module_lines.add(line)
+                elif (
+                    bias is not None
+                    and bias[0].qualname == symbol.qualname
+                    and bias[0].span == symbol.span
+                ):
+                    if not bias_added:
+                        biased.append((symbol.span, bias[1]))
+                        bias_added = True
                 elif knobs.symbol == "all":
                     for container in symbols:
                         if container.start <= line <= container.end:
@@ -467,7 +630,7 @@ def _apply_sqlglot(
                 if symbol is None:
                     module_lines.add(line)
 
-    if not ranges and not broad_lines:
+    if not ranges and not broad_lines and not biased:
         return True  # e.g. a pure insertion whose anchors do not exist
 
     removed_by_line = dict(removed)
@@ -509,6 +672,21 @@ def _apply_sqlglot(
     if ranges:
         ids = index.ids_for_ordinals(maps.covering_tests(path, ranges))
         parts.append(("coverage", f"{len(ranges)} ranges", ids))
+
+    if biased:
+        ids = set()
+        for span, lines in biased:
+            span_ids = index.ids_for_ordinals(maps.covering_tests(path, [span]))
+            line_ids = index.ids_for_ordinals(
+                maps.covering_tests(
+                    path, [(max(1, line - 1), line + 1) for line in lines]
+                )
+            )
+            narrowed = line_ids & span_ids
+            # Empty line coverage (or an empty intersection) falls back to the
+            # whole symbol: a missing map row must never lose a test.
+            ids |= narrowed if narrowed else span_ids
+        parts.append(("linebias", f"{len(biased)} hunks", ids))
 
     if broad_lines and knobs.classbody == "all":
         # v1 behaviour: every symbol of the file (kept only as an A/B variant).
@@ -560,7 +738,9 @@ def _apply_sqlglot(
             for name in sorted(assigned):
                 if name in collapses:
                     continue
-                result = _classattr_ids(maps, symbols, path, name, assigned[name])
+                result = _classattr_ids(
+                    maps, symbols, path, name, assigned[name], knobs.dialect_k
+                )
                 if result is not None:
                     classattr[name] = result
 
@@ -653,9 +833,15 @@ def select_commit(
     # Neutrality is decided per file and reused: comment-only files can be
     # skipped individually in a mixed commit, and a fully neutral commit runs
     # nothing.  This avoids parsing the same file twice.
-    neutral_flags = [_file_is_neutral(file_patch, maps) for file_patch in files]
+    neutral_flags = [
+        _file_is_neutral(file_patch, maps, knobs) for file_patch in files
+    ]
     if all(neutral_flags):
-        return Selection(set(), [RuleHit("neutral", detail="comment-only")], "neutral")
+        return Selection(
+            set(),
+            [RuleHit("neutral", detail="comment-only or enum-member flip")],
+            "neutral",
+        )
 
     selection = Selection()
 

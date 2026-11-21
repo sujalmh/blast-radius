@@ -651,6 +651,7 @@ class Maps:
         self._tar_unavailable = False
         self._source_cache: dict[str, bytes | None] = {}
         self._text_cache: dict[str, str | None] = {}
+        self._enum_index = None
         self._assignments_cache: dict[str, tuple[tuple[int, int, tuple[str, ...]], ...]] = {}
         self._definition_lines_cache: dict[str, dict[int, frozenset[str]]] = {}
         self._import_spans_cache: dict[str, tuple[tuple[int, int], ...]] = {}
@@ -1250,14 +1251,21 @@ class Maps:
         """Public form of :meth:`_class_family` (``unknown`` without class maps)."""
         return self._class_family(self._class_graph(), file, qualname)
 
-    def classattr_tests(self, file: str, qualname: str, name: str) -> set[str] | None:
+    def classattr_tests(
+        self,
+        file: str,
+        qualname: str,
+        name: str,
+        dialect_k: str = "intersect",
+    ) -> set[str] | None:
         """L4: test ids that can observe ``qualname.name`` being changed in ``file``.
 
         ``None`` means "unresolvable": the class is absent from
         ``classes.json.gz`` (or from the symbol table) and is not a known
         dialect class, so the caller must keep the L1 usage rule for that name.
 
-        The set is the class-family *universe* K, unioned with
+        The set is the class-family evidence, narrowed by the family universe K
+        where one exists, unioned with
           * tests covering a ``class_lines`` reference of ``name`` (statically
             resolved receivers: ``TSQL.WEEK_OFFSET``, bare module reads), and
           * tests covering any symbol span of the class or a descendant
@@ -1267,17 +1275,26 @@ class Maps:
         K depends on the family (see :meth:`_class_family`):
           * expression -- tests constructing the class or a descendant;
           * dialect -- tests whose exposure includes the class's dialect key or a
-            derived dialect, plus the constructors/spans we happen to know;
+            derived dialect, *intersected* with the reader/span evidence above
+            (an exposed test that never executes one of those lines cannot
+            observe the change; ``dialect_k="union"`` restores the old union);
           * unknown (or a dialect class without a usable exposure universe) --
-            no universe; ``instance_lines`` *and* ``self_lines`` stay in the
-            union (instance creation is not traced for Tokenizer/Parser/Generator
-            bodies, and a descendant we cannot see may read the attribute on
-            ``self``), so nothing is lost.
+            no universe; every receiver kind stays in the union (instance
+            creation is not traced for Tokenizer/Parser/Generator bodies, and a
+            descendant we cannot see may read the attribute on ``self``), so
+            nothing is lost.
 
         When the universe *is* captured, ``self``/``cls``-style reads need no
         separate term: a ``self.NAME`` read runs inside a method of the class or
         a descendant, i.e. inside a symbol span (expression tree) or a test that
         is exposed to the dialect (all derived dialects are in the family).
+
+        Dialect refinement (``dialect_k="intersect"``): the exposure universe is
+        narrowed to tests that also execute evidence -- a ``class``/``instance``/
+        ``self`` read line of ``name`` or a symbol span of the class/descendant.
+        A test that is merely exposed to the dialect but never runs one of those
+        lines cannot observe the change.  ``dialect_k="union"`` keeps the old,
+        wider uncoupled universe for A/B calibration.
         """
         graph = self._class_graph()
         if graph is None:
@@ -1297,6 +1314,7 @@ class Maps:
         for node in descendants:
             ids.update(graph.touched.get(node, ()))
 
+        universe: frozenset[str] | None = None
         universe_captured = family == "expression"
         if family == "dialect":
             allowed = (
@@ -1305,7 +1323,7 @@ class Maps:
                 else None
             )
             if allowed is not None:
-                ids.update(allowed)
+                universe = allowed
                 universe_captured = True
 
         spans: dict[str, list[tuple[int, int]]] = {}
@@ -1313,25 +1331,37 @@ class Maps:
             span = graph.spans.get(node)
             if span is not None:
                 spans.setdefault(span[0], []).append((span[1], span[2]))
+        span_ids: set[str] = set()
         for span_file, ranges in spans.items():
-            ids.update(self._ids_for_ordinals(self.covering_tests(span_file, ranges)))
+            span_ids.update(self._ids_for_ordinals(self.covering_tests(span_file, ranges)))
 
+        class_ids: set[str] = set()
+        reader_ids: set[str] = set()
         for style_file, detail in self.usage_style(name).items():
             lines = _style_lines(detail, "class_lines", "other_lines")
             if lines:
-                ids.update(
+                class_ids.update(
                     self._ids_for_ordinals(self.covering_tests(style_file, lines))
                 )
-            if universe_captured:
-                continue
-            # No universe: every receiver kind is evidence that a test touches
-            # this attribute, so keep all of it in the union.
             for bucket in ("instance_lines", "self_lines"):
                 extra = _style_lines(detail, bucket)
                 if extra:
-                    ids.update(
+                    reader_ids.update(
                         self._ids_for_ordinals(self.covering_tests(style_file, extra))
                     )
+
+        ids.update(span_ids)
+        ids.update(class_ids)
+        if not universe_captured:
+            # No captured instance universe: every receiver kind is evidence
+            # that a test touches this attribute, so keep all of it.
+            ids.update(reader_ids)
+        if universe is not None:
+            if family == "dialect" and dialect_k != "union":
+                # Sound tightening: exposure AND executable evidence.
+                ids |= universe & (span_ids | class_ids | reader_ids)
+            else:
+                ids |= universe
         return ids or None
 
     # -- pinned source: imports and literal entries ----------------------
@@ -1420,6 +1450,20 @@ class Maps:
         return self._shared
 
     # -- pinned source ---------------------------------------------------
+
+    def source_files(self) -> tuple[str, ...]:
+        """Every sqlglot source file at the pin (the symbol table's keys)."""
+        return tuple(str(name) for name in self._symbols())
+
+    def enum_index(self):
+        """Lazily built ``enum_neutral.EnumIndex`` over the pinned sources."""
+        index = getattr(self, "_enum_index", None)
+        if index is None:
+            from .enum_neutral import EnumIndex
+
+            index = EnumIndex(self.source_files(), self.source_text)
+            self._enum_index = index
+        return index
 
     def _open_tar(self) -> tarfile.TarFile | None:
         if self._tar is not None:

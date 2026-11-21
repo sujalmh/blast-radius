@@ -5,6 +5,11 @@ lines *and* the patched file parses to the same AST as the pinned file.  The
 AST half is what catches the trap in the brief: a line that looks like a
 comment but actually lives inside a triple-quoted string.
 
+A second, opt-in neutrality axis lives in ``enum_neutral.py``: a hunk whose only
+semantic change is an ``is``/``==`` flip between two proven members of one
+sqlglot ``Enum`` is neutral too (identity equality).  ``select`` passes its
+``EnumIndex`` here; without one only the comment rule applies.
+
 Reconstruction is in memory only; nothing is written to disk.
 """
 
@@ -137,27 +142,29 @@ def is_neutral_file(pinned_text: str, file_patch: FilePatch) -> bool:
 def commit_is_neutral(
     files: Iterable[FilePatch],
     source_of: Callable[[str], bytes | None],
+    enum_index: object | None = None,
 ) -> bool:
-    """True when the whole commit is comment-only and AST-safe.
+    """True when the whole commit is comment-only or enum-flip-only.
 
     ``source_of`` returns the pinned bytes for a repo-relative path (or None).
     Non-Python files only get the changed-line test: a ``#`` line in a SQL
-    fixture or a doc is harmless, and there is no AST to compare.
+    fixture or a doc is harmless, and there is no AST to compare.  When an
+    ``enum_index`` is supplied (``blastradius.enum_neutral.EnumIndex``), a
+    hunk whose only semantic change is an enum-member ``is``/``==`` flip is
+    neutral too.
     """
     files = list(files)
     if not files:
         return True
     for file_patch in files:
-        if not changed_lines_only_comments(file_patch):
-            return False
-    for file_patch in files:
         path = file_patch.path
         if path is None:
             return False
+        comment_only = changed_lines_only_comments(file_patch)
         if not path.endswith(".py"):
             # Fixture files can interpret '#' lines as directives; only
             # non-test assets are assumed comment-neutral.
-            if not non_python_change_is_harmless(path):
+            if not (comment_only and non_python_change_is_harmless(path)):
                 return False
             continue
         if file_patch.is_new or file_patch.is_deleted:
@@ -169,6 +176,11 @@ def commit_is_neutral(
             pinned_text = data.decode("utf-8")
         except UnicodeDecodeError:
             return False
-        if not is_neutral_file(pinned_text, file_patch):
-            return False
+        if comment_only and is_neutral_file(pinned_text, file_patch):
+            continue
+        if enum_index is not None and enum_index.is_neutral(  # type: ignore[attr-defined]
+            pinned_text, file_patch, path
+        ):
+            continue
+        return False
     return True

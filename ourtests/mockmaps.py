@@ -21,18 +21,22 @@ FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "mockrepo"
 
 SOURCE_FILES = (
     "sqlglot/__init__.py",
+    "sqlglot/blank.py",
     "sqlglot/consts.py",
     "sqlglot/core.py",
     "sqlglot/dialects/beam.py",
     "sqlglot/dialects/crane.py",
     "sqlglot/dialects/duck.py",
     "sqlglot/dialects/gander.py",
+    "sqlglot/enums.py",
     "sqlglot/expr.py",
     "sqlglot/lonely.py",
     "sqlglot/mod.py",
     "sqlglot/optimizer/simplify.py",
     "sqlglot/other.py",
+    "sqlglot/pairs.py",
     "sqlglot/tokens.py",
+    "sqlglot/wide.py",
 )
 
 TESTS = [
@@ -145,6 +149,12 @@ SYMBOLS = {
         ["week_offset", 1, 2, "function"],
         ["numeric_escape", 5, 6, "function"],
     ],
+    # W2f fixtures: enum-member comparisons (enum neutrality) and two
+    # function bodies with deliberately sparse line coverage (line bias).
+    "sqlglot/enums.py": [],
+    "sqlglot/wide.py": [["wide", 6, 12, "function"]],
+    "sqlglot/blank.py": [["lonely", 4, 11, "function"]],
+    "sqlglot/pairs.py": [["pairs", 6, 10, "function"]],
     "sqlglot/__init__.py": [],
 }
 
@@ -431,6 +441,13 @@ COVERAGE = {
     # NumericEscapes is covered only by test_delta (5).
     "sqlglot/tokens.py": [(3, [(6, 5)])],
     "sqlglot/optimizer/simplify.py": [(4, [(2, 1)]), (5, [(2, 1), (6, 1)])],
+    # Line bias: `wide` spans 6-12; changed line 11 (block 2) is covered by
+    # test_beta (12) and test_gamma (11), while test_alpha only reaches line 7
+    # (block 1).  `lonely` spans 4-11 but only line 11 (block 2) is covered, so
+    # a change on line 5 has empty line coverage and must fall back to the span.
+    "sqlglot/wide.py": [(0, [(7, 1)]), (1, [(12, 1)]), (2, [(11, 1)])],
+    "sqlglot/blank.py": [(1, [(11, 1)])],
+    "sqlglot/pairs.py": [(0, [(7, 1)]), (1, [(10, 1)])],
 }
 
 PATCHES = {
@@ -689,6 +706,142 @@ diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
 -    NUMERIC_ESCAPES = {"x": 1}
 +    NUMERIC_ESCAPES = {"x": 2}
 """,
+    # -- W2f: enum-member neutrality --------------------------------------
+    # Every operand is a proven member of `Strategy` (an Enum without its own
+    # __eq__), so `is` -> `==` is a no-op: the commit must be neutral.
+    "enum-neutral-flip": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -24,1 +24,1 @@ class Chooser:
+-        return self.selected is Strategy.UPPER
++        return self.selected == Strategy.UPPER
+""",
+    # The other operand is a parameter annotated with the enum class: neutral.
+    "enum-annotated": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -27,1 +27,1 @@ class Chooser:
+-        return mode is Strategy.UPPER
++        return mode == Strategy.UPPER
+""",
+    # A parameter can be rebound to a plain string: the assignment proof only
+    # sees enum-valued sites, so a parameter operand is never proven this way.
+    "enum-rebound-param": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -41,1 +41,1 @@ class Chooser:
+-        return self.rebound_selected is Strategy.UPPER
++        return self.rebound_selected == Strategy.UPPER
+""",
+    # Tuple targets are assignment sites too; this one binds plain strings.
+    "enum-tuple-target": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -45,1 +45,1 @@ class Chooser:
+-        return mode is Strategy.UPPER
++        return mode == Strategy.UPPER
+""",
+    # An untyped/str-capable operand is NOT provably a member: keep selecting.
+    "enum-str-operand": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -30,1 +30,1 @@ class Chooser:
+-        return other is Strategy.UPPER
++        return other == Strategy.UPPER
+""",
+    # `is None` vs `== None` is a real change (Expression.__eq__): not neutral.
+    "enum-none-flip": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -33,1 +33,1 @@ class Chooser:
+-        return self.selected is None
++        return self.selected == None
+""",
+    # An enum that defines __eq__ in its own body loses identity semantics.
+    "enum-custom-eq": """\
+diff --git a/sqlglot/enums.py b/sqlglot/enums.py
+--- a/sqlglot/enums.py
++++ b/sqlglot/enums.py
+@@ -36,1 +36,1 @@ class Chooser:
+-        return self.selected is EqStrategy.A
++        return self.selected == EqStrategy.A
+""",
+    # -- W2f: line-biased symbol selection --------------------------------
+    # `wide` (6-12): the changed line's coverers are a strict subset.
+    "line-bias-subset": """\
+diff --git a/sqlglot/wide.py b/sqlglot/wide.py
+--- a/sqlglot/wide.py
++++ b/sqlglot/wide.py
+@@ -11,1 +11,1 @@ def wide(flag):
+-        return a
++        return c
+""",
+    # Empty line coverage on the changed line: fall back to the whole symbol.
+    "line-bias-empty": """\
+diff --git a/sqlglot/blank.py b/sqlglot/blank.py
+--- a/sqlglot/blank.py
++++ b/sqlglot/blank.py
+@@ -5,1 +5,1 @@ def lonely(x):
+-    y = x + 1
++    y = x + 2
+""",
+    # A def/signature edit is never line-biased.
+    "line-bias-def": """\
+diff --git a/sqlglot/wide.py b/sqlglot/wide.py
+--- a/sqlglot/wide.py
++++ b/sqlglot/wide.py
+@@ -6,1 +6,1 @@
+-def wide(flag):
++def wide(other):
+""",
+    # A pure insertion has no changed old line: whole symbol.
+    "line-bias-insertion": """\
+diff --git a/sqlglot/wide.py b/sqlglot/wide.py
+--- a/sqlglot/wide.py
++++ b/sqlglot/wide.py
+@@ -8,0 +9,1 @@
++    inserted = 0
+""",
+    # A *rewritten* statement head keeps its line bias: entering the body still
+    # requires executing this very line.
+    "line-bias-statement-head": """\
+diff --git a/sqlglot/wide.py b/sqlglot/wide.py
+--- a/sqlglot/wide.py
++++ b/sqlglot/wide.py
+@@ -10,1 +10,1 @@
+-    if flag:
++    if not flag:
+""",
+    # A *deleted* statement head can move the body out of the pre-patch
+    # coverage, so it falls back to the whole symbol.
+    "line-bias-delete-head": """\
+diff --git a/sqlglot/wide.py b/sqlglot/wide.py
+--- a/sqlglot/wide.py
++++ b/sqlglot/wide.py
+@@ -10,2 +10,1 @@
+-    if flag:
+-        return a
++    return c
+""",
+    # Two hunks in one symbol must contribute their coverers independently:
+    # hunk 1 is covered by test_alpha, hunk 2 by test_beta.
+    "line-bias-two-hunks": """\
+diff --git a/sqlglot/pairs.py b/sqlglot/pairs.py
+--- a/sqlglot/pairs.py
++++ b/sqlglot/pairs.py
+@@ -7,1 +7,1 @@ def pairs(flag):
+-    a = 1
++    a = 2
+@@ -10,1 +10,1 @@ def pairs(flag):
+-    return a + b + c
++    return a + b + c + 1
+""",
 }
 
 # Selected test numbers per synthetic commit (Tier E includes every test).
@@ -734,6 +887,26 @@ EXPECTATIONS = {
     "l4-dialect-param": {4},
     # Tokenizer mirror: L4 = span {3} + the instance_lines reader {5}.
     "l4-tokenizer-instance": {3, 5},
+    # W2f: enum-member flips are neutral (both proven operands); the unproven /
+    # None / custom-__eq__ variants are not, but the mock file has no numbered
+    # tests and no coverage, so their selection is empty (they still must not
+    # be reported as a neutral commit -- the unit tests assert that directly).
+    "enum-neutral-flip": set(),
+    "enum-annotated": set(),
+    "enum-str-operand": set(),
+    "enum-none-flip": set(),
+    "enum-custom-eq": set(),
+    "enum-rebound-param": set(),
+    "enum-tuple-target": set(),
+    # W2f line bias: changed line coverers ({1,2}) win over the whole span
+    # ({0,1,2}); every fallback keeps the whole symbol.
+    "line-bias-subset": {1, 2},
+    "line-bias-empty": {1},
+    "line-bias-def": {0, 1, 2},
+    "line-bias-insertion": {0, 1, 2},
+    "line-bias-statement-head": {1, 2},
+    "line-bias-delete-head": {0, 1, 2},
+    "line-bias-two-hunks": {0, 1},
 }
 
 
