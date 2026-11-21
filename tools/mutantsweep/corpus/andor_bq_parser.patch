@@ -1,0 +1,11 @@
+--- a/sqlglot/parsers/bigquery.py
++++ b/sqlglot/parsers/bigquery.py
+@@ -473,7 +473,7 @@
+             if table.db:
+                 previous_db = table.args["db"]
+                 parts = table.db.split(".")
+-                if len(parts) == 2 and not table.args["db"].quoted:
++                if len(parts) == 2 or not table.args["db"].quoted:
+                     table.set(
+                         "catalog", exp.Identifier(this=parts[0]).update_positions(previous_db)
+                     )

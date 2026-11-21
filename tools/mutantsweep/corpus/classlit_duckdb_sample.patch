@@ -1,0 +1,11 @@
+--- a/sqlglot/generators/duckdb.py
++++ b/sqlglot/generators/duckdb.py
+@@ -1609,7 +1609,7 @@
+     SEMI_ANTI_JOIN_WITH_SIDE = False
+     CAST_TO_INT_ROUNDS = True
+     SAFE_INT_DIVISION = True
+-    TABLESAMPLE_KEYWORDS = "USING SAMPLE"
++    TABLESAMPLE_KEYWORDS = "USING AMPLE"
+     TABLESAMPLE_SEED_KEYWORD = "REPEATABLE"
+     LAST_DAY_SUPPORTS_DATE_PART = False
+     JSON_KEY_VALUE_PAIR_SEP = ","

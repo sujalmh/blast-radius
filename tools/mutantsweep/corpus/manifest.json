@@ -1,0 +1,192 @@
+{
+  "pin": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+  "mutants": [
+    {
+      "id": "andor_simplify",
+      "kind": "and_or",
+      "group": "a",
+      "file": "sqlglot/optimizer/simplify.py",
+      "line": 206,
+      "summary": "propagate_constants guard: `and (root or ...)` -> `or (root or ...)`",
+      "patch": "andor_simplify.patch",
+      "sha256": "1c76896aa8dc81bcfd3b1bb0f6cf383f2caab974be6d5d808219c43dd0bacc92",
+      "diff_lines": 11
+    },
+    {
+      "id": "andor_bq_parser",
+      "kind": "and_or",
+      "group": "a",
+      "file": "sqlglot/parsers/bigquery.py",
+      "line": 476,
+      "summary": "BigQuery dotted-identifier fixup: `len(parts) == 2 and ...` -> `or`",
+      "patch": "andor_bq_parser.patch",
+      "sha256": "ca5ce10dc80456b067d560bb9f0f38026e49938ff829c767e84ad344495f607a",
+      "diff_lines": 11
+    },
+    {
+      "id": "eqne_oracle_gen",
+      "kind": "eq_ne",
+      "group": "b",
+      "file": "sqlglot/generators/oracle.py",
+      "line": 154,
+      "summary": "Oracle table versioning: `kind == \"AS OF\"` -> `!=`",
+      "patch": "eqne_oracle_gen.patch",
+      "sha256": "082e498ca1c9081c1fbcefe4f5b577cb6d39a4d46ba85dcfdc11bda95df5a82c",
+      "diff_lines": 11
+    },
+    {
+      "id": "isnone_tsql_gen",
+      "kind": "is_none",
+      "group": "b",
+      "file": "sqlglot/generators/tsql.py",
+      "line": 446,
+      "summary": "TSQL time precision: `fractions is None` -> `is not None`",
+      "patch": "isnone_tsql_gen.patch",
+      "sha256": "ec268433c162544645c2f41024e07c2f675e471c265f8dbc531fbd42c96ae66b",
+      "diff_lines": 11
+    },
+    {
+      "id": "classlit_hive_regexp_group",
+      "kind": "class_literal",
+      "group": "c",
+      "file": "sqlglot/dialects/hive.py",
+      "line": 30,
+      "summary": "Hive class body: REGEXP_EXTRACT_DEFAULT_GROUP 1 -> 2",
+      "patch": "classlit_hive_regexp_group.patch",
+      "sha256": "cf0541eaa3e7485fa7aa87e299755303532f03db9c69d8d385fde75fcb58dff4",
+      "diff_lines": 11
+    },
+    {
+      "id": "classlit_duckdb_sample",
+      "kind": "class_literal",
+      "group": "c",
+      "file": "sqlglot/generators/duckdb.py",
+      "line": 1612,
+      "summary": "DuckDB class body: TABLESAMPLE_KEYWORDS \"USING SAMPLE\" -> \"USING SMPLE\"",
+      "patch": "classlit_duckdb_sample.patch",
+      "sha256": "c4f6c06e9a5f0e1d8323c5bfb9ce5c3e354bd9546b3ed1e4e3340edb52a78c2c",
+      "diff_lines": 11
+    },
+    {
+      "id": "classlit_typing_null",
+      "kind": "class_literal",
+      "group": "c",
+      "file": "sqlglot/typing/__init__.py",
+      "line": 433,
+      "summary": "typing metadata: exp.Null returns DType.NULL -> DType.UNKNOWN",
+      "patch": "classlit_typing_null.patch",
+      "sha256": "7ed155b2bb856336d2c5fbebf01dfe9ef58eaa245edf08e2627b2c977e78b9cf",
+      "diff_lines": 11
+    },
+    {
+      "id": "argtypes_groupconcat",
+      "kind": "arg_types",
+      "group": "d",
+      "file": "sqlglot/expressions/aggregate.py",
+      "line": 143,
+      "summary": "GroupConcat arg_types: \"separator\": False -> True",
+      "patch": "argtypes_groupconcat.patch",
+      "sha256": "8ce1e214f1979d8ed3489df672947c2ed5ca089fb09c20056e02f91ae7b188c5",
+      "diff_lines": 11
+    },
+    {
+      "id": "tokenizer_oracle_neq",
+      "kind": "tokenizer_table",
+      "group": "d",
+      "file": "sqlglot/dialects/oracle.py",
+      "line": 104,
+      "summary": "Oracle Tokenizer: \"^=\" TokenType.NEQ -> TokenType.EQ",
+      "patch": "tokenizer_oracle_neq.patch",
+      "sha256": "0b03944f521b121fed94b21e54b92ad312e6195164e4ff6468319c3d924d3285",
+      "diff_lines": 11
+    },
+    {
+      "id": "parsertbl_presto_datediff",
+      "kind": "parser_table",
+      "group": "d",
+      "file": "sqlglot/parsers/presto.py",
+      "line": 131,
+      "summary": "Presto DATE_DIFF builder: this=args[2] -> this=args[0]",
+      "patch": "parsertbl_presto_datediff.patch",
+      "sha256": "0dcfebef522a033349707b736351653da985a71a070fc18e81b0fd7ab327336d",
+      "diff_lines": 11
+    },
+    {
+      "id": "optcond_optimize_joins",
+      "kind": "optimizer_cond",
+      "group": "e",
+      "file": "sqlglot/optimizer/optimize_joins.py",
+      "line": 49,
+      "summary": "optimize_joins conjunct extraction: `len(...) < 2` -> `> 2`",
+      "patch": "optcond_optimize_joins.patch",
+      "sha256": "2d5fefde539230dfbb920d923a08d4253a4e8d4a1d2f2fad80c8a843051b359c",
+      "diff_lines": 11
+    },
+    {
+      "id": "optcond_pushdown_pos",
+      "kind": "optimizer_cond",
+      "group": "e",
+      "file": "sqlglot/optimizer/pushdown_predicates.py",
+      "line": 94,
+      "summary": "pushdown_predicates: `position >= last_null_extending` -> `<=`",
+      "patch": "optcond_pushdown_pos.patch",
+      "sha256": "63868e69d9ccfb70b5b05bf826798535ecbb971ecafa4a4a97743e7d6924875a",
+      "diff_lines": 11
+    },
+    {
+      "id": "fixture_eliminate_joins",
+      "kind": "fixture",
+      "group": "f",
+      "file": "tests/fixtures/optimizer/eliminate_joins.sql",
+      "line": 58,
+      "summary": "eliminate_joins fixture: DISTINCT ON LIMIT 1 -> LIMIT 2 (input line)",
+      "patch": "fixture_eliminate_joins.patch",
+      "sha256": "dfdf3cb7cfca30a83c8edc26b8fc9ee22583f7b1bfa55f2f9d6b0d1b30ff67ad",
+      "diff_lines": 11
+    },
+    {
+      "id": "fixture_qualify_columns",
+      "kind": "fixture",
+      "group": "f",
+      "file": "tests/fixtures/optimizer/qualify_columns.sql",
+      "line": 32,
+      "summary": "qualify_columns fixture: output alias b -> c (input line)",
+      "patch": "fixture_qualify_columns.patch",
+      "sha256": "0f18c1f2867be3ccabaab6bf0528f1c1abb07e415acf7e2707d200a7d67cc53c",
+      "diff_lines": 11
+    },
+    {
+      "id": "fixture_identity_cast",
+      "kind": "fixture",
+      "group": "f",
+      "file": "tests/fixtures/identity.sql",
+      "line": 390,
+      "summary": "identity fixture: CAST(a AS INT) -> CAST(a AS VARCHAR)",
+      "patch": "fixture_identity_cast.patch",
+      "sha256": "c95cd45adb8e0a926dc0f83bd6b9352aa59c00d200ce6a56397005384942049c",
+      "diff_lines": 11
+    },
+    {
+      "id": "control_comment_oracle",
+      "kind": "comment",
+      "group": "g",
+      "file": "sqlglot/generators/oracle.py",
+      "line": 15,
+      "summary": "comment-only insertion (known neutral control)",
+      "patch": "control_comment_oracle.patch",
+      "sha256": "177c04605913276db31ad721c9981bc9776831e3d38200fe013b0dcc2961e50e",
+      "diff_lines": 10
+    },
+    {
+      "id": "control_enum_dialect",
+      "kind": "enum_is",
+      "group": "g",
+      "file": "sqlglot/dialects/dialect.py",
+      "line": 1223,
+      "summary": "enum comparison: `strategy is NormalizationStrategy.X` -> `==` (neutral control)",
+      "patch": "control_enum_dialect.patch",
+      "sha256": "ab4e8b81d930769b54f4e831fe254e12a83651669c075149c7e86adbe2b4e980",
+      "diff_lines": 11
+    }
+  ]
+}

@@ -12,8 +12,8 @@ Outputs (all 0644, deterministic gzip: mtime=0, no filename in the header):
 
   tests_index.json, coverage.bin.gz, symbols.json.gz, usage.json.gz,
   usage_refs.json.gz, usage_style.json.gz, fixtures.json.gz, dialects.json.gz,
-  keyreads.json.gz, testimports.json.gz, classes.json.gz, source.tar.gz,
-  MANIFEST.json
+  keyreads.json.gz, testimports.json.gz, classes.json.gz, enum_flips.json.gz,
+  source.tar.gz, MANIFEST.json
 
 Format details live in MAPS_SPEC.md; this script is the only writer.  It is
 stdlib-only except for ``coverage.numbits`` (installed in the mapgen image).
@@ -972,6 +972,564 @@ def build_usage_style(trees: dict[str, ast.AST], hierarchy: dict[str, list[str]]
         if by_file:
             payload[name] = by_file
     return payload
+
+
+# ------------------------------------------------------------------ enum flips
+# W1h: the pinned source lines on which flipping ``is``/``==`` (or ``is not``/
+# ``!=``) between two operands that provably evaluate to members of one
+# sqlglot ``Enum`` cannot change behaviour (``Enum`` defines ``__eq__`` as
+# identity).
+#
+# This is a *port* of ``blastradius/enum_neutral.py``'s proof: the mapgen image
+# is built from ``tools/mapgen/`` only, so it cannot import the selector
+# package, and computing the set once here is exactly what lets the selector
+# answer with a line-set lookup instead of building the index at run time.
+# The two implementations must agree; ``ourtests/test_enum_map.py`` pins that
+# on the mock tree.  Keep them in sync.
+_ENUM_ROOTS = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
+_ENUM_MAX_DEPTH = 6
+
+
+def _enum_module_of(rel: str) -> str:
+    without_suffix = rel[: -len(".py")] if rel.endswith(".py") else rel
+    parts = without_suffix.split("/")
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _enum_base_name(node) -> str | None:
+    """Last dotted component of a base-class expression (``a.b.C`` -> ``C``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+class _EnumClassInfo:
+    __slots__ = ("file", "module", "qualname", "node")
+
+    def __init__(self, file: str, module: str, qualname: str, node) -> None:
+        self.file = file
+        self.module = module
+        self.qualname = qualname
+        self.node = node
+
+    @property
+    def fqname(self) -> str:
+        return f"{self.module}.{self.qualname}"
+
+
+class EnumLineProver:
+    """Proven enum-member comparison lines, from the pinned ASTs.
+
+    Same gates as the runtime checker: an *enum* is a class under ``sqlglot/``
+    whose (transitively resolved) bases reach ``enum.Enum`` and whose own body
+    defines neither ``__eq__`` nor ``__ne__``; a *member* is an attribute chain
+    resolved through the file's import bindings; the other operand is proven by
+    an annotation, by every assignment / property-return site constructing that
+    enum, or by being a member of the same enum itself.  ``None`` literals,
+    untyped operands and rebound parameters are never proven.
+    """
+
+    def __init__(self, trees: dict[str, ast.AST]) -> None:
+        self._trees = trees
+        self._loaded = False
+        self._classes: dict[str, _EnumClassInfo] = {}
+        self._enums: dict[str, frozenset[str]] = {}
+        self._enum_eq: dict[str, bool] = {}
+        self._imports: dict[str, dict[str, tuple[str, str]]] = {}
+        self._annotations: dict[str, dict[str, list[tuple[ast.AST, int, int]]]] = {}
+        self._param_names: dict[str, frozenset[str]] = {}
+        self._dynamic_names: dict[str, frozenset[str]] = {}
+        self._dynamic_attrs: dict[str, frozenset[str]] = {}
+        self._attr_sites: dict[str, list[tuple[str, ast.AST]]] | None = None
+        self._name_sites: dict[str, dict[str, list[ast.AST]]] | None = None
+
+    # -- small helpers ---------------------------------------------------
+
+    def _module_classes(self, file: str) -> dict[str, _EnumClassInfo]:
+        module = _enum_module_of(file)
+        return {
+            info.qualname: info
+            for info in self._classes.values()
+            if info.module == module
+        }
+
+    def _class_info(self, fqname: str) -> _EnumClassInfo | None:
+        return self._classes.get(fqname)
+
+    # -- index -----------------------------------------------------------
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        for file, tree in self._trees.items():
+            module = _enum_module_of(file)
+            self._collect_classes(file, module, tree.body, "")
+            self._imports[file] = self._collect_imports(file, module, tree)
+            self._annotations[file] = self._collect_annotations(tree)
+            parameters, dynamic_names, dynamic_attrs = self._collect_bindings(tree)
+            self._param_names[file] = frozenset(parameters)
+            self._dynamic_names[file] = frozenset(dynamic_names)
+            self._dynamic_attrs[file] = frozenset(dynamic_attrs)
+        self._resolve_enums()
+
+    def _collect_classes(self, file: str, module: str, body, prefix: str) -> None:
+        for node in body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            qualname = f"{prefix}{node.name}"
+            self._classes[f"{module}.{qualname}"] = _EnumClassInfo(
+                file, module, qualname, node
+            )
+            self._collect_classes(file, module, node.body, f"{qualname}.")
+
+    def _collect_imports(self, file: str, module: str, tree) -> dict[str, tuple[str, str]]:
+        """``local name -> ("module"|"symbol", dotted target)`` for module scope."""
+        bindings: dict[str, tuple[str, str]] = {}
+        package = module.rpartition(".")[0]
+        for node in getattr(tree, "body", ()):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        bindings[alias.asname] = ("module", alias.name)
+                    else:
+                        head = alias.name.split(".", 1)[0]
+                        bindings[head] = ("module", head)
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                level = node.level or 0
+                if level:
+                    parts = package.split(".") if package else []
+                    if level - 1 <= len(parts):
+                        parts = parts[: len(parts) - (level - 1)] if level > 1 else parts
+                    base = ".".join([part for part in parts if part] + ([base] if base else []))
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    target = f"{base}.{alias.name}" if base else alias.name
+                    bindings[alias.asname or alias.name] = ("symbol", target)
+        return bindings
+
+    def _collect_annotations(self, tree) -> dict[str, list[tuple[ast.AST, int, int]]]:
+        """Name -> ``(annotation, scope_start, scope_end)`` for lexical scopes."""
+        annotations: dict[str, list[tuple[ast.AST, int, int]]] = {}
+        module_end = getattr(tree, "end_lineno", None) or 10**9
+
+        def add(name, annotation, scope) -> None:
+            if name and annotation is not None:
+                annotations.setdefault(name, []).append((annotation, scope[0], scope[1]))
+
+        def walk(node, scope) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner = (node.lineno, node.end_lineno or node.lineno)
+                arguments = node.args
+                for arg in (
+                    list(arguments.posonlyargs)
+                    + list(arguments.args)
+                    + list(arguments.kwonlyargs)
+                ):
+                    add(arg.arg, arg.annotation, inner)
+                if arguments.vararg is not None:
+                    add(arguments.vararg.arg, arguments.vararg.annotation, inner)
+                if arguments.kwarg is not None:
+                    add(arguments.kwarg.arg, arguments.kwarg.annotation, inner)
+                for statement in node.body:
+                    walk(statement, inner)
+                return
+            if isinstance(node, ast.ClassDef):
+                for statement in node.body:
+                    walk(statement, scope)
+                return
+            if isinstance(node, ast.AnnAssign):
+                target = node.target
+                if isinstance(target, ast.Name):
+                    add(target.id, node.annotation, scope)
+                return
+            for child in ast.iter_child_nodes(node):
+                walk(child, scope)
+
+        walk(tree, (1, module_end))
+        return annotations
+
+    def _collect_bindings(self, tree) -> tuple[set[str], set[str], set[str]]:
+        """Names a plain ``x = rhs`` scan cannot describe (params, loops, ...)."""
+        parameters: set[str] = set()
+        names: set[str] = set()
+        attrs: set[str] = set()
+
+        def collect(target) -> None:
+            if target is None:
+                return
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+            elif isinstance(target, ast.Attribute):
+                attrs.add(target.attr)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for element in target.elts:
+                    collect(element)
+            elif isinstance(target, ast.Starred):
+                collect(target.value)
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arguments = node.args
+                for arg in (
+                    list(arguments.posonlyargs)
+                    + list(arguments.args)
+                    + list(arguments.kwonlyargs)
+                ):
+                    parameters.add(arg.arg)
+                if arguments.vararg is not None:
+                    parameters.add(arguments.vararg.arg)
+                if arguments.kwarg is not None:
+                    parameters.add(arguments.kwarg.arg)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                collect(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    collect(item.optional_vars)
+            elif isinstance(node, ast.comprehension):
+                collect(node.target)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.NamedExpr):
+                collect(node.target)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                names.add(node.rest)
+        return parameters, names, attrs
+
+    @staticmethod
+    def _target_names(target) -> tuple[set[str], set[str]]:
+        names: set[str] = set()
+        attrs: set[str] = set()
+
+        def visit(node) -> None:
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                attrs.add(node.attr)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for element in node.elts:
+                    visit(element)
+            elif isinstance(node, ast.Starred):
+                visit(node.value)
+
+        visit(target)
+        return names, attrs
+
+    def _resolve_enums(self) -> None:
+        resolved: dict[str, bool] = {}
+        changed = True
+        while changed:
+            changed = False
+            for fqname, info in self._classes.items():
+                if fqname in resolved:
+                    continue
+                is_enum = False
+                for base in info.node.bases:
+                    name = _enum_base_name(base)
+                    if name is None:
+                        continue
+                    if name in _ENUM_ROOTS:
+                        is_enum = True
+                        break
+                    target = self._resolve_class_expression(base, info.file)
+                    if target is not None and resolved.get(target):
+                        is_enum = True
+                        break
+                if is_enum:
+                    resolved[fqname] = True
+                    changed = True
+        for fqname in resolved:
+            info = self._classes[fqname]
+            members: set[str] = set()
+            has_eq = False
+            for statement in info.node.body:
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if statement.name in ("__eq__", "__ne__"):
+                        has_eq = True
+                    continue
+                targets: list = []
+                if isinstance(statement, ast.Assign):
+                    targets = list(statement.targets)
+                elif isinstance(statement, ast.AnnAssign):
+                    targets = [statement.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                        members.add(target.id)
+            self._enums[fqname] = frozenset(members)
+            self._enum_eq[fqname] = has_eq
+
+    # -- resolution ------------------------------------------------------
+
+    def _resolve_class_expression(self, node, file: str) -> str | None:
+        resolved = self._resolve(node, file)
+        if resolved is None:
+            return None
+        kind, target = resolved
+        return target if kind == "class" else None
+
+    def _resolve(self, node, file: str) -> tuple[str, str] | None:
+        if isinstance(node, ast.Name):
+            bindings = self._imports.get(file, {})
+            binding = bindings.get(node.id)
+            if binding is not None:
+                kind, target = binding
+                if kind == "module":
+                    return "module", target
+                if self._class_info(target) is not None:
+                    return "class", target
+                if any(name.startswith(target + ".") for name in self._classes):
+                    return "module", target
+                return None
+            local = self._module_classes(file).get(node.id)
+            if local is not None:
+                return "class", local.fqname
+            return None
+
+        if isinstance(node, ast.Attribute):
+            base = self._resolve(node.value, file)
+            if base is None:
+                return None
+            kind, target = base
+            if kind == "module":
+                candidate = f"{target}.{node.attr}"
+                if self._class_info(candidate) is not None:
+                    return "class", candidate
+                if any(name.startswith(candidate + ".") for name in self._classes):
+                    return "module", candidate
+                return None
+            if kind == "class":
+                candidate = f"{target}.{node.attr}"
+                if self._class_info(candidate) is not None:
+                    return "class", candidate
+                if target in self._enums and node.attr in self._enums[target]:
+                    return "member", target
+                return None
+            return None
+
+        if isinstance(node, ast.Call):
+            resolved = self._resolve(node.func, file)
+            if resolved is None:
+                return None
+            kind, target = resolved
+            if kind == "class" and target in self._enums:
+                return "instance", target
+            return None
+
+        return None
+
+    # -- proof -----------------------------------------------------------
+
+    def _usable_enum(self, fqname: str) -> bool:
+        return fqname in self._enums and not self._enum_eq.get(fqname, True)
+
+    def _member_enum(self, node, file: str) -> str | None:
+        resolved = self._resolve(node, file)
+        if resolved is None or resolved[0] != "member":
+            return None
+        return resolved[1] if self._usable_enum(resolved[1]) else None
+
+    @staticmethod
+    def _operand_name(node) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def _assignment_sites(self) -> None:
+        if self._attr_sites is not None:
+            return
+        attr_sites: dict[str, list[tuple[str, ast.AST]]] = {}
+        name_sites: dict[str, dict[str, list[ast.AST]]] = {}
+        for file, tree in self._trees.items():
+            per_file = name_sites.setdefault(file, {})
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    targets: list = list(node.targets)
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    targets = [node.target]
+                else:
+                    continue
+                for target in targets:
+                    names, attrs = self._target_names(target)
+                    for name in names:
+                        per_file.setdefault(name, []).append(node.value)
+                    for attr in attrs:
+                        attr_sites.setdefault(attr, []).append((file, node.value))
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not any(
+                        _enum_base_name(decorator) == "property"
+                        for decorator in node.decorator_list
+                    ):
+                        continue
+                    for inner in ast.walk(node):
+                        if isinstance(inner, ast.Return) and inner.value is not None:
+                            attr_sites.setdefault(node.name, []).append(
+                                (file, inner.value)
+                            )
+            self._collect_class_body_assignments(file, tree.body, attr_sites)
+        self._attr_sites = attr_sites
+        self._name_sites = name_sites
+
+    def _collect_class_body_assignments(
+        self, file: str, body, attr_sites: dict[str, list[tuple[str, ast.AST]]]
+    ) -> None:
+        for statement in body:
+            if isinstance(statement, ast.ClassDef):
+                self._collect_class_body_assignments(file, statement.body, attr_sites)
+                continue
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    names, _ = self._target_names(target)
+                    for name in names:
+                        attr_sites.setdefault(name, []).append((file, statement.value))
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                names, _ = self._target_names(statement.target)
+                for name in names:
+                    attr_sites.setdefault(name, []).append((file, statement.value))
+
+    def _annotation_enum(self, node: ast.Name, file: str) -> str | None:
+        annotations = self._annotations.get(file, {}).get(node.id, [])
+        in_scope = [
+            annotation
+            for annotation, start, end in annotations
+            if start <= node.lineno <= end
+        ]
+        if not in_scope:
+            return None
+        resolved = {
+            target
+            for annotation in in_scope
+            if (target := self._resolve_class_expression(annotation, file)) is not None
+        }
+        if len(resolved) == 1:
+            return next(iter(resolved))
+        return None
+
+    def _proven_enum(
+        self,
+        node,
+        file: str,
+        target: str,
+        depth: int = 0,
+        seen: frozenset[tuple[str, str]] = frozenset(),
+    ) -> bool:
+        if depth > _ENUM_MAX_DEPTH or not self._usable_enum(target):
+            return False
+        resolved = self._resolve(node, file)
+        if resolved is not None:
+            kind, fqname = resolved
+            if kind in ("member", "instance"):
+                return fqname == target
+            if kind == "class":
+                return False
+
+        name = self._operand_name(node)
+        if name is None:
+            return False
+
+        if isinstance(node, ast.Name):
+            annotation = self._annotation_enum(node, file)
+            if annotation == target:
+                return True
+            if name in self._param_names.get(file, ()) or name in self._dynamic_names.get(
+                file, ()
+            ):
+                return False
+        elif name in self._dynamic_attrs.get(file, ()):
+            return False
+
+        key = (file, name)
+        if key in seen or depth >= _ENUM_MAX_DEPTH:
+            return False
+        self._assignment_sites()
+        assert self._attr_sites is not None and self._name_sites is not None
+        if isinstance(node, ast.Name):
+            sites = [(file, rhs) for rhs in self._name_sites.get(file, {}).get(name, [])]
+        else:
+            sites = list(self._attr_sites.get(name, []))
+        if not sites:
+            return False
+        next_seen = seen | {key}
+        return all(
+            self._proven_enum(rhs, site_file, target, depth + 1, next_seen)
+            for site_file, rhs in sites
+        )
+
+    def _same_enum_pair(self, left, right, file: str) -> bool:
+        for primary, other in ((left, right), (right, left)):
+            enum = self._member_enum(primary, file)
+            if enum is not None and self._proven_enum(other, file, enum):
+                return True
+        return False
+
+    def _compare_is_proven(self, node: ast.Compare, file: str) -> bool:
+        if not node.ops:
+            return False
+        left = node.left
+        for op, right in zip(node.ops, node.comparators):
+            if type(op) not in (ast.Is, ast.IsNot, ast.Eq, ast.NotEq):
+                return False
+            if not self._same_enum_pair(left, right, file):
+                return False
+            left = right
+        return True
+
+    # -- output ----------------------------------------------------------
+
+    def proven_lines(self) -> dict[str, tuple[int, ...]]:
+        """``{file: (line, ...)}``; a line needs *every* comparison proven."""
+        self._load()
+        found: dict[str, tuple[int, ...]] = {}
+        for file, tree in self._trees.items():
+            per_line: dict[int, list[bool]] = {}
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Compare):
+                    continue
+                if node.lineno != (node.end_lineno or node.lineno):
+                    per_line.setdefault(node.lineno, []).append(False)
+                    continue
+                per_line.setdefault(node.lineno, []).append(
+                    self._compare_is_proven(node, file)
+                )
+            lines = tuple(
+                sorted(line for line, results in per_line.items() if results and all(results))
+            )
+            if lines:
+                found[file] = lines
+        return found
+
+
+def build_enum_flips(trees: dict[str, ast.AST]) -> tuple[dict, dict[str, int]]:
+    """maps/enum_flips.json.gz: ``{"lines": {pinned file: [line, ...]}}``.
+
+    A line is listed only when every comparison on it is a proven same-enum
+    ``is``/``is not``/``==``/``!=`` pair, so a hunk that flips one of its
+    operators in place cannot change behaviour.  The selector needs nothing
+    else: an unlisted line simply selects normally.
+    """
+    prover = EnumLineProver(trees)
+    found = prover.proven_lines()
+    payload = {
+        "lines": {rel: list(lines) for rel, lines in sorted(found.items())},
+    }
+    stats = {
+        "files": len(found),
+        "lines": sum(len(lines) for lines in found.values()),
+        "enums": len(prover._enums),
+        "identity_enums": sum(1 for has_eq in prover._enum_eq.values() if not has_eq),
+    }
+    return payload, stats
 
 
 # -------------------------------------------------------------------- testing
@@ -2025,6 +2583,17 @@ def main(argv: list[str] | None = None) -> int:
     symbols_size = _write_gz(os.path.join(out, "symbols.json.gz"), _json_bytes(symbols))
     log(f"symbols: files={len(symbols)} entries={sum(len(v) for v in symbols.values())}")
 
+    enum_flips, enum_stats = build_enum_flips(trees)
+    enum_size = _write_gz(os.path.join(out, "enum_flips.json.gz"), _json_bytes(enum_flips))
+    log(
+        "enum_flips: files={} lines={} enums={} identity_enums={}".format(
+            enum_stats["files"],
+            enum_stats["lines"],
+            enum_stats["enums"],
+            enum_stats["identity_enums"],
+        )
+    )
+
     usage, crossfile = build_usage(trees)
     usage_size = _write_gz(os.path.join(out, "usage.json.gz"), _json_bytes(usage))
     refs_size = _write_gz(os.path.join(out, "usage_refs.json.gz"), _json_bytes(crossfile))
@@ -2171,6 +2740,17 @@ def main(argv: list[str] | None = None) -> int:
             "classes_hierarchy": hierarchy_stats["classes"],
             "usage_style_names": len(style),
             "testimport_modules": ti_stats["modules"],
+            "enum_flip_lines": enum_stats["lines"],
+        },
+        "enum_flips": {
+            # W1h: lines whose comparisons are all proven same-enum pairs, so
+            # an in-place is/== flip on them is neutral.  The selector's proof
+            # is a lookup in this set; the runtime AST index is the fallback
+            # for a bundle without this map.
+            "files": enum_stats["files"],
+            "lines": enum_stats["lines"],
+            "enum_classes": enum_stats["enums"],
+            "identity_enums": enum_stats["identity_enums"],
         },
         "keyreads": {
             "proxied_names": len(dynamic.get("names") or {}),
@@ -2236,13 +2816,15 @@ def main(argv: list[str] | None = None) -> int:
             "keyreads.json.gz",
             "testimports.json.gz",
             "classes.json.gz",
+            "enum_flips.json.gz",
             "source.tar.gz",
             "MANIFEST.json",
         )
     )
     log(
         "sizes: coverage={}B symbols={}B usage={}B refs={}B style={}B fixtures={}B dialects={}B "
-        "keyreads={}B testimports={}B classes={}B source={}B manifest={}B total={}B".format(
+        "keyreads={}B testimports={}B classes={}B enum={}B source={}B manifest={}B "
+        "total={}B".format(
             coverage_size,
             symbols_size,
             usage_size,
@@ -2253,6 +2835,7 @@ def main(argv: list[str] | None = None) -> int:
             keyreads_size,
             imports_size,
             classes_size,
+            enum_size,
             source_size,
             manifest_size,
             total,

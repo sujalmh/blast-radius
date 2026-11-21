@@ -1,0 +1,11 @@
+--- a/sqlglot/generators/oracle.py
++++ b/sqlglot/generators/oracle.py
+@@ -151,7 +151,7 @@
+         return self.func("CURRENT_TIMESTAMP", this) if this else "CURRENT_TIMESTAMP"
+ 
+     def version_sql(self, expression: exp.Version) -> str:
+-        if expression.text("kind") == "AS OF":
++        if expression.text("kind") != "AS OF":
+             value = expression.expression
+             value_sql = (
+                 self.func("TO_TIMESTAMP", value, exp.Literal.string("YYYY-MM-DD HH24:MI:SS.FF6"))

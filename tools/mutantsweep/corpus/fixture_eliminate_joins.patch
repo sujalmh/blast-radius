@@ -1,0 +1,11 @@
+--- a/tests/fixtures/optimizer/eliminate_joins.sql
++++ b/tests/fixtures/optimizer/eliminate_joins.sql
+@@ -55,7 +55,7 @@
+   SELECT DISTINCT ON (y.b)
+     y.b
+   FROM y
+-  LIMIT 1
++  LIMIT 2
+ ) AS y
+   ON x.b = y.b;
+ SELECT

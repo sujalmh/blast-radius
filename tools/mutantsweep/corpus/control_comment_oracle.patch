@@ -1,0 +1,10 @@
+--- a/sqlglot/generators/oracle.py
++++ b/sqlglot/generators/oracle.py
+@@ -13,6 +13,7 @@
+     trim_sql,
+ )
+ 
++# Kept for parity with the reference implementation
+ 
+ def _trim_sql(self: OracleGenerator, expression: exp.Trim) -> str:
+     position = expression.args.get("position")

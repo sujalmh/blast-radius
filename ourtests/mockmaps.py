@@ -224,6 +224,14 @@ USAGE_REFS = {
     "NUMERIC_ESCAPES": {"sqlglot/optimizer/simplify.py": [6]},
 }
 
+# W1h committed enum-flip map: the pinned lines whose comparisons all pass the
+# enum proof (both operands provably members of one sqlglot Enum that defines
+# no __eq__/__ne__).  For the mock tree that is exactly the two neutral W2f
+# cases -- `self.selected is/== Strategy.UPPER` (line 24, every assignment site
+# of `selected` is a Strategy member) and the annotated parameter (line 27);
+# the unproven/None/custom-__eq__ lines are deliberately absent.
+ENUM_FLIPS = {"lines": {"sqlglot/enums.py": [24, 27]}}
+
 TEST_IDS_ORDINAL = [test["id"] for test in TESTS]
 
 # v2 maps (handcrafted, same formats as tools/mapgen writes).
@@ -977,11 +985,14 @@ def build_maps(target: Path | str, with_v2: bool = True) -> Path:
     (target / "coverage.bin.gz").write_bytes(gzip.compress(_coverage_blob(), mtime=0))
     _write_source_tar(target / "source.tar.gz")
     if with_v2:
+        # ``with_v2=False`` is the pre-W1h bundle: no enum map either, so the
+        # selector takes the lazy runtime-index fallback.
         _write_gz_json(target / "dialects.json.gz", DIALECTS)
         _write_gz_json(target / "keyreads.json.gz", KEYREADS)
         _write_gz_json(target / "testimports.json.gz", TESTIMPORTS)
         _write_gz_json(target / "classes.json.gz", CLASSES)
         _write_gz_json(target / "usage_style.json.gz", USAGE_STYLE)
+        _write_gz_json(target / "enum_flips.json.gz", ENUM_FLIPS)
     manifest = {
         "pin": "mock",
         "sqlglot_sha1": {

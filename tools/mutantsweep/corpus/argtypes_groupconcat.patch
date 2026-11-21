@@ -1,0 +1,11 @@
+--- a/sqlglot/expressions/aggregate.py
++++ b/sqlglot/expressions/aggregate.py
+@@ -140,7 +140,7 @@
+ class GroupConcat(Expression, AggFunc):
+     arg_types = {
+         "this": True,
+-        "separator": False,
++        "separator": True,
+         "on_overflow": False,
+         "null_separator_is_empty": False,
+     }

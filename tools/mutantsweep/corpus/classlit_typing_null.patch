@@ -1,0 +1,11 @@
+--- a/sqlglot/typing/__init__.py
++++ b/sqlglot/typing/__init__.py
+@@ -430,7 +430,7 @@
+     exp.Lag: {"annotator": lambda self, e: self._annotate_by_args(e, "this", "default")},
+     exp.Lead: {"annotator": lambda self, e: self._annotate_by_args(e, "this", "default")},
+     exp.Literal: {"annotator": lambda self, e: self._annotate_literal(e)},
+-    exp.Null: {"returns": exp.DType.NULL},
++    exp.Null: {"returns": exp.DType.UNKNOWN},
+     exp.Nullif: {"annotator": lambda self, e: self._annotate_by_args(e, "this", "expression")},
+     exp.PropertyEQ: {"annotator": lambda self, e: self._annotate_by_args(e, "expression")},
+     exp.Struct: {"annotator": lambda self, e: self._annotate_struct(e)},

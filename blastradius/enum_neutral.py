@@ -28,6 +28,18 @@ prefilter (:func:`maybe_enum_flip`) only lets a file through when one of its
 parses anything.  When a hunk does qualify, the index is built once per process
 and every parse/index/assignment scan is cached on the instance for the rest of
 the batch.
+
+**Committed line set (W1h).**  Building that index costs ~1.3-2.4 s of CPU per
+process (several on the scoring fleet), and CPU seconds are scored.  So the
+same proof is also run once at map-generation time over the pinned ASTs and
+shipped as ``maps/enum_flips.json.gz``: ``{"lines": {file: [pinned line, ...]}}``
+where a line is listed only when *every* comparison starting and ending on it
+passes the gates below (:meth:`EnumIndex.proven_lines`).  At run time the proof
+for a hunk is then a line-set lookup (:func:`is_committed_flip`): the pairing
+gate must still show that each ``-`` line pairs with exactly one ``+`` line
+that differs by nothing but the operator spelling, and each of those old lines
+must be in the committed set.  No AST of the pinned tree is parsed.  When the
+map is absent (an older bundle) :class:`EnumIndex` is used exactly as before.
 """
 
 from __future__ import annotations
@@ -58,6 +70,18 @@ def _folded(line: str) -> str:
     folded = _IS_NOT_TOKEN.sub("!=", line)
     folded = _IS_TOKEN.sub("==", folded)
     return _WHITESPACE.sub("", folded)
+
+
+def _op_folded(line: str) -> str:
+    """``line`` with only the operator *spelling* folded (whitespace kept).
+
+    Unlike :func:`_folded` this keeps the indentation and every interior space,
+    so two lines that fold onto the same text differ in nothing but ``is`` /
+    ``is not`` versus ``==`` / ``!=`` (plus the whitespace *inside* that
+    operator).  The committed-map proof pairs lines with this stricter fold: an
+    indentation or spacing edit is a real change and must not pair.
+    """
+    return _IS_NOT_TOKEN.sub("!=", _IS_TOKEN.sub("==", line))
 
 
 def maybe_enum_flip(file_patch: FilePatch) -> bool:
@@ -644,6 +668,60 @@ class EnumIndex:
                 return True
         return False
 
+    # -- committed line set ----------------------------------------------
+
+    def _compare_is_proven(self, node: ast.Compare, file: str) -> bool:
+        """True when every comparator pair is a proven same-enum comparison.
+
+        Every operator of the chain must itself be one of ``is`` / ``is not`` /
+        ``==`` / ``!=``: a chain that also holds (say) a ``<`` cannot be
+        certified, because flipping one link is then not the only possible
+        change on that line.
+        """
+        if not node.ops:
+            return False
+        left = node.left
+        for op, right in zip(node.ops, node.comparators):
+            if type(op) not in (ast.Is, ast.IsNot, ast.Eq, ast.NotEq):
+                return False
+            if not self._same_enum_pair(left, right, file):
+                return False
+            left = right
+        return True
+
+    def proven_lines(self) -> dict[str, tuple[int, ...]]:
+        """Pinned lines whose comparisons all pass the gates (mapgen parity).
+
+        A line is listed only when *every* ``Compare`` node of the file that
+        starts on it is proven by :meth:`_compare_is_proven`.  A comparison
+        that spans several lines is never certified: ``ast`` reports only the
+        node's first line, and the operator may sit on a later one, so the line
+        a patch hunk would touch is not recoverable from the node.
+
+        ``tools/mapgen/gen_maps.py`` ships this exact set as
+        ``maps/enum_flips.json.gz``; ``ourtests/test_enum_map.py`` pins the two
+        implementations to the same answer on the mock tree.
+        """
+        self._load()
+        found: dict[str, tuple[int, ...]] = {}
+        for file, tree in self._trees.items():
+            per_line: dict[int, list[bool]] = {}
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Compare):
+                    continue
+                if node.lineno != (node.end_lineno or node.lineno):
+                    per_line.setdefault(node.lineno, []).append(False)
+                    continue
+                per_line.setdefault(node.lineno, []).append(
+                    self._compare_is_proven(node, file)
+                )
+            lines = tuple(
+                sorted(line for line, results in per_line.items() if results and all(results))
+            )
+            if lines:
+                found[file] = lines
+        return found
+
     # -- AST diff --------------------------------------------------------
 
     def _diff(
@@ -751,3 +829,81 @@ def _has_comparison_flip(pinned: ast.AST, patched: ast.AST) -> bool:
             if _has_comparison_flip(value_a, value_b):
                 return True
     return False
+
+
+# -- committed line set (maps/enum_flips.json.gz) -------------------------
+def _hunk_flip_lines(hunk) -> list[int] | None:
+    """Old line numbers of a hunk that prove an operator-only flip, or ``None``.
+
+    Every ``-`` line must pair with exactly one ``+`` line of the same hunk
+    whose text is identical once ``is not``/``is`` is folded onto ``!=``/``==``
+    -- i.e. the pair differs by nothing but that spelling (:func:`_op_folded`
+    keeps all whitespace, so re-indenting or re-spacing never pairs).  A pair
+    whose texts are equal is not a flip and is rejected as well: the removed
+    line merely moved, which this proof cannot certify.
+
+    Any line added or removed without a partner (a pure insertion or deletion,
+    a re-wrapped expression) makes the whole hunk unprovable.
+    """
+    removed: list[tuple[int, str]] = []
+    cursor = hunk.old_start
+    for body in hunk.body:
+        if body.startswith("\\"):
+            continue
+        if body.startswith("+"):
+            continue
+        if body.startswith("-"):
+            removed.append((cursor, body[1:]))
+            cursor += 1
+            continue
+        cursor += 1
+    added = [body[1:] for body in hunk.body if body.startswith("+")]
+    if not removed or not added:
+        return None
+    pool: dict[str, list[str]] = {}
+    for line in added:
+        pool.setdefault(_op_folded(line), []).append(line)
+    lines: list[int] = []
+    for number, text in removed:
+        candidates = pool.get(_op_folded(text))
+        if not candidates:
+            return None
+        for position, candidate in enumerate(candidates):
+            if candidate != text:
+                del candidates[position]
+                lines.append(number)
+                break
+        else:
+            return None
+    return lines
+
+
+def is_committed_flip(
+    proven: dict[str, object] | None, path: str, file_patch: FilePatch
+) -> bool:
+    """Proof from the committed line set (no pinned AST is parsed).
+
+    ``proven`` is ``maps/enum_flips.json.gz``'s ``lines`` table.  A file patch
+    is neutral when every hunk is an operator-only pairing (see
+    :func:`_hunk_flip_lines`) and every paired *old* line is a proven line of
+    the pinned file.  Anything unproven -- an unlisted line, a hunk with an
+    extra addition or deletion, a file absent from the map -- is not neutral
+    and falls through to normal selection, which never drops a test.
+    """
+    if not proven:
+        return False
+    lines = proven.get(path)
+    if not lines:
+        return False
+    proven_lines = frozenset(int(line) for line in lines)  # type: ignore[union-attr]
+    hunks = file_patch.hunks or ()
+    if not hunks:
+        return False
+    for hunk in hunks:
+        numbers = _hunk_flip_lines(hunk)
+        if not numbers:
+            return False
+        for number in numbers:
+            if number not in proven_lines:
+                return False
+    return True

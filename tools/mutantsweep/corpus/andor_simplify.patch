@@ -1,0 +1,11 @@
+--- a/sqlglot/optimizer/simplify.py
++++ b/sqlglot/optimizer/simplify.py
+@@ -203,7 +203,7 @@
+ 
+     if (
+         isinstance(expression, exp.And)
+-        and (root or not expression.same_parent)
++        or (root or not expression.same_parent)
+         and sqlglot.optimizer.normalize.normalized(expression, dnf=True)
+     ):
+         constant_mapping = {}

@@ -652,6 +652,8 @@ class Maps:
         self._source_cache: dict[str, bytes | None] = {}
         self._text_cache: dict[str, str | None] = {}
         self._enum_index = None
+        self._enum_flips: dict[str, frozenset[int]] | None = None
+        self._enum_flips_loaded = False
         self._assignments_cache: dict[str, tuple[tuple[int, int, tuple[str, ...]], ...]] = {}
         self._definition_lines_cache: dict[str, dict[int, frozenset[str]]] = {}
         self._import_spans_cache: dict[str, tuple[tuple[int, int], ...]] = {}
@@ -760,6 +762,32 @@ class Maps:
                 "usage_style.json.gz", quiet=True
             )
         return self._usage_style_raw
+
+    def enum_flip_lines(self) -> dict[str, frozenset[int]] | None:
+        """``enum_flips.json.gz`` (W1h): file -> proven ``is``/``==`` lines.
+
+        ``None`` means the map is absent (an older, v2/v3 bundle): the caller
+        must fall back to building :class:`enum_neutral.EnumIndex` from
+        ``source.tar.gz``.  An *empty* dict means the map shipped but lists no
+        line, which is a proof of nothing -- never a reason to look at sources.
+        """
+        if self._enum_flips_loaded:
+            return self._enum_flips
+        self._enum_flips_loaded = True
+        document = self._optional_json("enum_flips.json.gz", quiet=True)
+        table = document.get("lines")
+        if not isinstance(table, dict):
+            self._enum_flips = None
+            return None
+        lines: dict[str, frozenset[int]] = {}
+        for file, numbers in table.items():
+            if not isinstance(file, str) or not isinstance(numbers, list):
+                continue
+            lines[file] = frozenset(
+                int(number) for number in numbers if isinstance(number, int)
+            )
+        self._enum_flips = lines
+        return lines
 
     # -- symbols ---------------------------------------------------------
 
@@ -1464,6 +1492,11 @@ class Maps:
         batch whose commits never flip an ``is``/``==`` spelling therefore never
         builds (or even allocates the file list of) the index, and a batch that
         does need it builds it at most once -- the instance is cached here.
+
+        W1h: this is the **fallback** for a bundle without
+        ``maps/enum_flips.json.gz``.  When that map is present,
+        :func:`_file_is_neutral` answers from the committed line set and this
+        index is never built.
         """
         index = getattr(self, "_enum_index", None)
         if index is None:

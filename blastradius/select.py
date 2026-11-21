@@ -227,6 +227,13 @@ def _file_is_neutral(file_patch: FilePatch, maps: Maps, knobs: Knobs) -> bool:
         return False
     if not enum_neutral.maybe_enum_flip(file_patch):
         return False
+    # W1h: when the bundle ships the proven line set, the answer is a lookup
+    # (no pinned AST is parsed, no index is built).  Only an older bundle
+    # without maps/enum_flips.json.gz pays for the lazy runtime index, exactly
+    # as before.
+    committed = maps.enum_flip_lines()
+    if committed is not None:
+        return enum_neutral.is_committed_flip(committed, path, file_patch)
     return maps.enum_index().is_neutral(text, file_patch, path)
 
 

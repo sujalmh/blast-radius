@@ -350,6 +350,90 @@ def main() -> int:
         if args.name:
             print(f"  {args.name} style: {usage_style.get(args.name)}")
 
+    # ------------------------------------------------- enum flips (W1h)
+    enum_flips: dict | None = None
+    enum_path = os.path.join(args.maps, "enum_flips.json.gz")
+    if not os.path.isfile(enum_path):
+        errors.append("enum_flips.json.gz: missing")
+    else:
+        try:
+            document = read_gz_json(enum_path)
+        except Exception as error:  # noqa: BLE001
+            errors.append(f"enum_flips.json.gz: unreadable ({error})")
+        else:
+            lines_table = document.get("lines") if isinstance(document, dict) else None
+            if not isinstance(lines_table, dict):
+                errors.append('enum_flips.json.gz: expected {"lines": {file: [line, ...]}}')
+            else:
+                enum_flips = lines_table
+
+    if enum_flips is not None:
+        normal_strategy: list[str] = []
+        source_texts: dict[str, str] = {}
+        if members:
+            try:
+                with tarfile.open(os.path.join(args.maps, "source.tar.gz"), "r:gz") as tar:
+                    for member in tar.getmembers():
+                        if not member.isfile() or not member.name.endswith(".py"):
+                            continue
+                        extracted = tar.extractfile(member)
+                        if extracted is None:
+                            continue
+                        text = extracted.read().decode("utf-8", "replace")
+                        if member.name in enum_flips:
+                            source_texts[member.name] = text
+                        if "class NormalizationStrategy" in text:
+                            normal_strategy.append(member.name)
+            except (FileNotFoundError, tarfile.TarError) as error:  # noqa: BLE001
+                errors.append(f"enum_flips.json.gz: cannot read source.tar.gz ({error})")
+        total = sum(len(v) for v in enum_flips.values() if isinstance(v, list))
+        print(f"\nenum_flips.json.gz: files={len(enum_flips)} lines={total}")
+        for rel in sorted(enum_flips):
+            numbers = enum_flips[rel]
+            if members and rel not in members:
+                errors.append(f"enum_flips.json.gz: path missing from source: {rel}")
+                continue
+            if not isinstance(numbers, list) or not numbers:
+                errors.append(f"enum_flips.json.gz: empty/non-list entry for {rel}")
+                continue
+            if not all(
+                isinstance(line, int) and not isinstance(line, bool) and line > 0
+                for line in numbers
+            ):
+                errors.append(f"enum_flips.json.gz: non-positive-int line in {rel}")
+                continue
+            if numbers != sorted(set(numbers)):
+                errors.append(f"enum_flips.json.gz: unsorted or duplicate lines in {rel}")
+                continue
+            text = source_texts.get(rel)
+            if text is None:
+                continue
+            pinned_lines = text.splitlines()
+            if numbers[-1] > len(pinned_lines):
+                errors.append(
+                    f"enum_flips.json.gz: {rel} lists line {numbers[-1]} but the "
+                    f"pinned file has {len(pinned_lines)}"
+                )
+                continue
+            blank = [line for line in numbers if not pinned_lines[line - 1].strip()]
+            if blank:
+                errors.append(f"enum_flips.json.gz: {rel}:{blank[:3]} are blank lines")
+        for rel in ("sqlglot/dialects/dialect.py", "sqlglot/enums.py"):
+            if rel in source_texts:
+                print(f"  {rel}: {enum_flips.get(rel)}")
+        if normal_strategy and not enum_flips:
+            errors.append(
+                "enum_flips.json.gz: no proven line although the pin defines "
+                f"NormalizationStrategy ({normal_strategy[:2]})"
+            )
+        if args.file and enum_flips.get(args.file):
+            text = source_texts.get(args.file)
+            pinned_lines = text.splitlines() if text is not None else []
+            print(f"  proven flip lines of {args.file}:")
+            for line in enum_flips[args.file]:
+                content = pinned_lines[line - 1].strip() if line <= len(pinned_lines) else "?"
+                print(f"    {line}: {content}")
+
     if args.file:
         path = args.file
         intervals = coverage.get(path, [])
