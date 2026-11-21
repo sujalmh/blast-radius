@@ -68,3 +68,47 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
+
+## Our approach
+
+We replace the starter's "run everything" with static analysis of the pinned
+commit. `tools/mapgen/` runs once in the labelled image against
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa` and commits its output under
+`maps/`, so the build only pulls the base image and copies committed files: no
+sqlglot clone, no pip install, no network.
+
+The maps, all derived from the pinned checkout only:
+
+- `maps/coverage.bin.gz` — per test id, the `sqlglot/` lines it executes (per-test coverage contexts).
+- `maps/symbols.json.gz` — every function and class in `sqlglot/**/*.py`, with its 1-based line range.
+- `maps/usage.json.gz` — every module/class-body assigned name and every line in `sqlglot/` referencing it, so a constant edited in a class body reaches the tests that read it.
+- `maps/fixtures.json.gz` — test-data file to the tests that read it; the tests each `tests/*.py` defines; the shared helpers.
+- `maps/dialects.json.gz` — the dialects each test runs under, and which files are scoped to one dialect.
+- `maps/keyreads.json.gz` — which tests actually read a given key of a module- or class-level dict constant, plus a `keyable`/`opaque` safety classification of every such constant.
+- `maps/testimports.json.gz` — the sqlglot modules each test file's imports reach.
+- `maps/source.tar.gz` — the pinned `sqlglot/` sources, read only for the comment-neutrality check.
+- `maps/tests_index.json`, `maps/MANIFEST.json` — stable test ids (the ordinals answers use) and generation metadata.
+
+At run time `selector.py` reads the patches and `tests.json` from `/data` and
+never runs sqlglot. Each patch's hunks become changed old-line spans, split
+into `sqlglot/` sources, test files, fixtures and the rest. A source span
+selects every symbol it intersects, narrowed to the tests exposed to that
+file's dialect when the file is dialect-scoped. A span touching module or
+class-body level instead selects the tests covering the usage lines of the
+names assigned there (again dialect-narrowed), and may drop further to the
+tests that read the changed constant's key, but only when the constant is
+provably `keyable` and the read trace is demonstrably live. A test file
+selects its own tests, a shared helper the full suite, a fixture the tests
+that read it. The union is deduplicated against `tests.json` and packed
+longest-first onto `k` workers, keeping the cheapest `max load + 2s * k`.
+
+**Neutral comments.** When every hunk only adds or removes blank or `#`
+comment lines, we rebuild the patched file in memory, `ast.parse` both the
+pinned and the patched source and compare `ast.dump`. Identical ASTs mean the
+change cannot alter behaviour, so the answer is `"workers": []`. A coding
+declaration in the first two lines disables the shortcut.
+
+**Fallback ladder.** Anything unknown or risky — a new `sqlglot/` file, a hunk
+past the pinned file length, an unreadable patch, an unknown fixture, a shared
+helper — selects the whole suite. Tier E costs about 29 s; a missed failing
+test costs 300 s.

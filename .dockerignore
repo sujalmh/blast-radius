@@ -1,0 +1,34 @@
+# Build context for the scorer. Keep in: selector.py, blastradius/, maps/ and
+# this Dockerfile (BuildKit reads it, it is never copied). Everything listed
+# below is intentionally excluded: it is either local development material the
+# container never reads (sample/, bench/, tools/, ourtests/, scripts/, the
+# scorer, the docs, the Makefile, requirements.lock) or VCS/interpreter noise.
+# Excluding it keeps the context small and the image a pure function of the
+# files the selector actually uses.
+
+# Never shipped: the buildathon session token must not enter the build context
+# or an image layer, even by accident.
+.buildathon_session
+
+# Local validation kit -- the scorer mounts its own copy of these at /data.
+sample/
+bench/
+ourtests/
+tools/
+scripts/
+score.py
+output.jsonl
+MAPS_SPEC.md
+AGENTS.md
+SCORING.md
+requirements.lock
+Makefile
+README.md
+
+# VCS, editor and interpreter leftovers.
+.git
+.gitignore
+.venv/
+**/__pycache__/
+**/*.pyc
+.DS_Store
