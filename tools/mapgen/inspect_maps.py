@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_maps import _lines_to_runs, assigned_bindings, parse_coverage_payload  # noqa: E402
 
 KINDS = {"keyable", "opaque"}
+USAGE_STYLE_KEYS = ("self_lines", "class_lines", "instance_lines")
 
 
 def read_gz_json(path: str):
@@ -334,10 +335,12 @@ def main() -> int:
             for rel, detail in by_file.items():
                 if members and rel not in members:
                     errors.append(f"usage_style.json.gz: path missing from source: {rel}")
-                if not isinstance(detail, dict) or set(detail) != {"self_lines", "other_lines"}:
+                if not isinstance(detail, dict) or not set(detail).issubset(USAGE_STYLE_KEYS):
                     errors.append(f"usage_style.json.gz: bad split for {name}@{rel}")
                     continue
-                for key in ("self_lines", "other_lines"):
+                for key in USAGE_STYLE_KEYS:
+                    if key not in detail:
+                        continue
                     lines = detail[key]
                     if not isinstance(lines, list) or not all(
                         isinstance(line, int) for line in lines
