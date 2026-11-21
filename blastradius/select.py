@@ -42,6 +42,20 @@ one new value, the snowflake ``NUMERIC_ESCAPES`` shape) is compared
 structurally against the pinned entry.  The same key/index set with exactly one
 changed value names the changed key; a key-set change, two changed values, a
 different container kind or an unparseable line yields no key and L1 is kept.
+
+W2j changes what "the changed class-body/module-level lines" MEANS: they are the
+**AST statement extent of every removed (``-``) line**, computed against the
+pinned source (``Maps.statement_span``), not the hunk's old range.  Context
+lines contribute nothing, because a unified-diff context line is byte-identical
+in both trees: a failing test can only be affected through a value that actually
+changed, i.e. through an assignment whose statement contains a removed line.  The
+statement extent keeps multi-line constants whose only removed line is deep
+inside the literal: removing ``"b": 2,`` from ``FOO = {`` ... ``}`` makes the
+whole statement (header included) changed, so ``FOO`` is still collected.  Pure
+insertions contribute no class-body *names* (a constant inserted after the pin
+has no readers in it) while the anchor/symbol rules keep handling inserted code
+lines exactly as before.  The anchor safety union (tests covering the changed
+lines themselves) is computed over the same statement-expanded removed-line set.
 """
 
 from __future__ import annotations
@@ -64,7 +78,10 @@ INIT_FILE = "sqlglot/__init__.py"
 IMPORT_SHARE_TIER_E = 0.8
 
 # L3 needs a proven-alive proxy: at least this many tests read *other* keys.
-KEYREAD_ALIVE_TESTS = 5
+# W2j lowers the bar 5 -> 3: three distinct tests reading other keys of the same
+# constant already prove that the key-read proxy records real reads (measured:
+# the sample holds 0 misses with this bar in every knob variant).
+KEYREAD_ALIVE_TESTS = 3
 
 _MISSING = object()
 
@@ -784,7 +801,13 @@ def _apply_sqlglot(
     file_len = maps.file_length(path)
     ranges: list[tuple[int, int]] = []
     biased: list[tuple[tuple[int, int], tuple[int, ...]]] = []
-    broad_lines: set[int] = set()
+    # W2j: the changed class-body/module-level line set is the AST statement
+    # extent of the removed lines (names + anchor), the pure-insertion anchors
+    # (anchor only: an inserted constant has no pinned readers) and the
+    # whole-file "function" lines (the v1 module-level treatment).
+    stmt_lines: set[int] = set()
+    insert_lines: set[int] = set()
+    whole_file_lines: set[int] = set()
     module_lines: set[int] = set()
     hunk_lines: list[int] = []
     removed: list[tuple[int, str]] = []
@@ -796,6 +819,13 @@ def _apply_sqlglot(
             body_starts = _function_body_starts(ast.parse(source_text))
         except (SyntaxError, ValueError):
             body_starts = None
+
+    def _body_level(line: int) -> tuple[bool, bool]:
+        """``(class_or_module_level, module_level)`` for an old line."""
+        symbol = _innermost(symbols, line)
+        if symbol is None:
+            return True, True
+        return symbol.kind != "function", False
 
     for hunk in file_patch.hunks:
         if file_len is not None:
@@ -827,7 +857,7 @@ def _apply_sqlglot(
                     and symbol.end >= file_len - 1
                 )
                 if whole_file:
-                    broad_lines.add(line)
+                    whole_file_lines.add(line)
                     module_lines.add(line)
                 elif (
                     bias is not None
@@ -843,11 +873,31 @@ def _apply_sqlglot(
                             ranges.append(container.span)
                 else:
                     ranges.append(symbol.span)
-            else:
-                # Module-level, class-body, or trailing text outside any symbol.
-                broad_lines.add(line)
-                if symbol is None:
+        # Only removed lines name a changed class-body/module-level statement;
+        # the statement extent (pinned AST) makes a mid-literal removal own its
+        # multi-line header, so its name is still collected.
+        for line, _text in removed_texts:
+            body_level, module_level = _body_level(line)
+            if not body_level:
+                continue
+            span = maps.statement_span(path, line)
+            if span is None:
+                span = (line, line)
+            stmt_lines.update(range(span[0], span[1] + 1))
+            if module_level:
+                module_lines.update(range(span[0], span[1] + 1))
+        if hunk.old_count == 0:
+            # Pure insertion: anchor-only, no names (see the module docstring).
+            for line in old_lines:
+                body_level, module_level = _body_level(line)
+                if not body_level:
+                    continue
+                insert_lines.add(line)
+                if module_level:
                     module_lines.add(line)
+
+    broad_lines = stmt_lines | insert_lines | whole_file_lines
+    named_lines = stmt_lines | whole_file_lines
 
     if not ranges and not broad_lines and not biased:
         return True  # e.g. a pure insertion whose anchors do not exist
@@ -915,15 +965,18 @@ def _apply_sqlglot(
         parts.append(("classbody_all", f"{len(symbols)} symbols", ids))
 
     if broad_lines:
-        # Safety union: tests whose coverage includes the changed lines.
+        # Safety union: tests whose coverage includes the changed lines.  W2j
+        # computes it over the statement-expanded *removed*-line set (plus the
+        # pure-insertion anchors and whole-file lines): an untouched context
+        # line cannot be why a test fails.
         ids = index.ids_for_ordinals(
             maps.covering_tests(path, [(line, line) for line in broad_lines])
         )
         parts.append(("anchor", f"{len(broad_lines)} lines", ids))
 
-    if broad_lines and knobs.classbody != "off":
+    if named_lines and knobs.classbody != "off":
         assigned: dict[str, set[int]] = {}
-        for line in sorted(broad_lines):
+        for line in sorted(named_lines):
             for name in maps.assignments_on_lines(path, {line}):
                 assigned.setdefault(name, set()).add(line)
 
@@ -958,7 +1011,7 @@ def _apply_sqlglot(
         classattr: dict[str, tuple[set[str], str]] = {}
         if (
             knobs.l4 == "on"
-            and any(_enclosing_classes(symbols, line) for line in broad_lines)
+            and any(_enclosing_classes(symbols, line) for line in named_lines)
             and maps.has_classes()
         ):
             for name in sorted(assigned):

@@ -347,6 +347,27 @@ def _collect_assignments(tree: ast.AST) -> tuple[tuple[int, int, tuple[str, ...]
     return tuple(spans)
 
 
+def _collect_statement_spans(tree: ast.AST) -> tuple[tuple[int, int], ...]:
+    """``(lineno, end_lineno)`` extent of every AST statement in the file.
+
+    Every statement node counts, at every nesting level.  A multi-line
+    statement (``FOO = {`` ... ``}``) therefore reports its *whole* extent, so a
+    removed line that is a single entry deep inside the literal still maps back
+    to the statement (and its assigned name) that owns it.
+    """
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        start = getattr(node, "lineno", None)
+        if start is None:
+            continue
+        end = getattr(node, "end_lineno", start)
+        spans.append((int(start), int(end if end is not None else start)))
+    spans.sort()
+    return tuple(spans)
+
+
 def _collect_import_spans(tree: ast.AST) -> tuple[tuple[int, int], ...]:
     """Spans of module-level ``import`` / ``from ... import`` statements."""
     spans: list[tuple[int, int]] = []
@@ -657,6 +678,7 @@ class Maps:
         self._assignments_cache: dict[str, tuple[tuple[int, int, tuple[str, ...]], ...]] = {}
         self._definition_lines_cache: dict[str, dict[int, frozenset[str]]] = {}
         self._import_spans_cache: dict[str, tuple[tuple[int, int], ...]] = {}
+        self._statement_spans_cache: dict[str, tuple[tuple[int, int], ...]] = {}
         self._literal_entries_cache: dict[
             str, tuple[tuple[int, int, str, str, str | None, int | None, bool], ...]
         ] = {}
@@ -1402,6 +1424,25 @@ class Maps:
             return ast.parse(text)
         except (SyntaxError, ValueError):
             return None
+
+    def statement_span(self, file: str, line: int) -> tuple[int, int] | None:
+        """Innermost AST statement extent containing ``line``, or ``None``.
+
+        The pinned AST is parsed once per changed file and cached.  ``None``
+        means no statement covers the line (a decorator line, a comment, an
+        unparseable source): callers then fall back to the line itself.
+        """
+        cached = self._statement_spans_cache.get(file)
+        if cached is None:
+            tree = self._pinned_tree(file)
+            cached = _collect_statement_spans(tree) if tree is not None else ()
+            self._statement_spans_cache[file] = cached
+        best: tuple[int, int] | None = None
+        for start, end in cached:
+            if start <= line <= end:
+                if best is None or (end - start) < (best[1] - best[0]):
+                    best = (start, end)
+        return best
 
     def import_spans(self, file: str) -> tuple[tuple[int, int], ...]:
         """Module-level import statement spans (empty when unparseable)."""

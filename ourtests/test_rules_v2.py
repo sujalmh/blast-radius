@@ -184,6 +184,110 @@ def test_classbody_off_keeps_only_the_anchor_union(loaded):
     } == {"anchor"}
 
 
+# -- (b2) W2j: removed-line statement semantics --------------------------
+#
+# The changed class-body/module-level line set is the AST statement extent of
+# every removed ("-") line.  Context lines are byte-identical in both trees, so
+# they can never be *why* a test fails; a removed line deep inside a multi-line
+# literal still owns its whole statement (header included), so the literal's
+# name is still collected.
+
+
+def test_statement_span_returns_the_whole_statement(loaded):
+    maps, _ = loaded
+    # LIMITS = { ... } spans 3-7: the header (4 is the first entry) and the
+    # closing brace belong to the statement of the removed entry on line 5.
+    assert maps.statement_span("sqlglot/consts.py", 3) == (3, 7)
+    assert maps.statement_span("sqlglot/consts.py", 5) == (3, 7)
+    assert maps.statement_span("sqlglot/consts.py", 7) == (3, 7)
+    # A class-body multi-line dict: `TABLE = {` on 27, `"q": 2,` on 29.
+    assert maps.statement_span("sqlglot/consts.py", 29) == (27, 30)
+    # Nothing covers a blank line, an unknown file, or a decorator gap.
+    assert maps.statement_span("sqlglot/consts.py", 21) is None
+    assert maps.statement_span("sqlglot/missing.py", 1) is None
+
+
+def test_multi_line_literal_with_a_removed_middle_line_collects_the_name(loaded):
+    """Removing `"q": 2,` (line 29) must still collect Registry.TABLE.
+
+    The statement header (``TABLE = {``, line 27) is a *context* line; only the
+    statement extent makes it part of the changed statement, so the class-body
+    name ladder still sees ``TABLE`` and selects its readers.
+    """
+    maps, index = loaded
+    assert maps.statement_span("sqlglot/consts.py", 29) == (27, 30)
+    selection, numbers = _select(
+        "keyread-class-qualified",
+        maps,
+        index,
+        Knobs(keyreads="off", l4="off", dialect="off"),
+    )
+    assert "TABLE" in " ".join(
+        hit.detail for hit in selection.rules if hit.rule == "usage"
+    )
+    # L1 of TABLE: every test covering its reference line (23).
+    assert numbers == {0, 1, 2, 3, 4, 5}
+
+
+def test_anchor_union_covers_the_whole_changed_statement(loaded):
+    """W2j: the safety union is the statement extent, not the single removed line."""
+    maps, index = loaded
+    selection, _numbers = _select(
+        "keyread-collapse",
+        maps,
+        index,
+        Knobs(keyreads="off", l4="off", dialect="off"),
+    )
+    anchor = [hit for hit in selection.rules if hit.rule == "anchor"]
+    # `"b": 2,` (line 5) -> LIMITS statement 3-7: five lines, not one.
+    assert anchor and anchor[0].detail == "5 lines"
+    assert selection.by_rule["anchor"] == {"tests/test_mod.py::test_beta"}
+
+
+def test_context_lines_contribute_no_class_body_names(loaded):
+    """A function-body edit whose *context* lines sit in a class body.
+
+    ``LIMIT = 3`` (line 11) is context, byte-identical in both trees, so the
+    class-body ladder must not collect ``LIMIT`` (pre-W2j it did).
+    """
+    (file_patch,) = parse_patch(
+        _one_file(
+            "sqlglot/mod.py",
+            "@@ -11,4 +11,4 @@\n"
+            "     LIMIT = 3\n"
+            " \n"
+            "     def beta(self, y):\n"
+            "-        return y * self.LIMIT\n"
+            "+        return y * (self.LIMIT + 1)\n",
+        )
+    )
+    maps, index = loaded
+    selection = select_commit([file_patch], maps, index, Knobs(dialect="off"))
+    rules = {hit.rule for hit in selection.rules}
+    assert not {"usage", "classattr", "keyread"} & rules
+    assert "LIMIT" not in " ".join(hit.detail for hit in selection.rules)
+    # Only the line-biased method body: test_beta covers 13-14.
+    assert index.numbers_for_ids(selection.tests) == {1}
+
+
+def test_pure_insertion_adds_no_class_body_names(loaded):
+    """An inserted constant has no pinned readers: anchor only, no names.
+
+    Pre-W2j the insertion anchors (old lines 3/4) landed on ``WEEK_OFFSET``'s
+    statement and pulled its readers in; W2j selects no class-body names.
+    """
+    (file_patch,) = parse_patch(
+        _one_file("sqlglot/mod.py", "@@ -3,0 +4,1 @@\n+NEW_CONST = 1\n")
+    )
+    maps, index = loaded
+    selection = select_commit([file_patch], maps, index, Knobs(dialect="off"))
+    rules = {hit.rule for hit in selection.rules}
+    assert "anchor" in rules
+    assert not {"usage", "classattr", "keyread"} & rules
+    assert "WEEK_OFFSET" not in " ".join(hit.detail for hit in selection.rules)
+    assert index.numbers_for_ids(selection.tests) == set()
+
+
 # -- (c) L3 key-read narrowing ------------------------------------------
 
 
@@ -255,7 +359,7 @@ def test_keyread_whole_container_index_key(loaded):
         "keyread-whole-two",  # two values changed: not one key
         "keyread-whole-keyset",  # the key set changed
         "keyread-whole-unparseable",  # the new line is not a container
-        "keyread-whole-sparse",  # too few tests read the other keys (4d63's shape)
+        "keyread-whole-sparse",  # only 2 tests read the other keys (4d63 shape)
     ],
 )
 def test_keyread_whole_container_refusals_keep_l1(loaded, patch_name):
@@ -299,7 +403,7 @@ def test_whole_container_rewrite_needs_one_removed_and_one_added_line():
     [
         "keyread-readers",  # the changed key has recorded readers
         "keyread-opaque",  # static usage kind is not "keyable"
-        "keyread-sparse",  # fewer than 5 tests read other keys (proxy not alive)
+        "keyread-sparse",  # only 2 tests read other keys (proxy not alive)
         "keyread-ambiguous",  # the changed line does not give one constant key
     ],
 )
@@ -309,6 +413,31 @@ def test_l3_gate_failure_keeps_l1(loaded, patch_name):
     assert numbers == {0, 1, 2, 3, 4, 5}  # L1 kept, nothing collapsed
     assert "keyread" not in {hit.rule for hit in selection.rules}
     assert "usage" in {hit.rule for hit in selection.rules}
+
+
+def test_keyread_alive_gate_accepts_three_reader_tests(tmp_path):
+    """W2j: three distinct tests reading other keys prove the proxy is alive.
+
+    ``keyread-whole-sparse`` (the 4d63 shape with a sparse read map) is refused
+    with two alive readers; a third read of the same constant flips the gate.
+    """
+    maps_dir = mockmaps.build_maps(tmp_path / "maps")
+    exposure = {
+        test_id: [list(pair) for pair in pairs]
+        for test_id, pairs in mockmaps.KEYREADS["exposure"].items()
+    }
+    exposure[mockmaps.TEST_IDS_ORDINAL[2]].append(["BACKUP", "a"])
+    mockmaps._write_gz_json(
+        maps_dir / "keyreads.json.gz", {**mockmaps.KEYREADS, "exposure": exposure}
+    )
+    maps = Maps.load(maps_dir)
+    index = _index(maps)
+    try:
+        selection, numbers = _select("keyread-whole-sparse", maps, index)
+        assert numbers == {0, 1, 2}  # exactly the readers of BACKUP's keys
+        assert "keyread" in {hit.rule for hit in selection.rules}
+    finally:
+        maps.close()
 
 
 def test_definition_lines_are_not_references(loaded):

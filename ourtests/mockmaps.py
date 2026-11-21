@@ -677,7 +677,7 @@ diff --git a/sqlglot/consts.py b/sqlglot/consts.py
 +ORDERED = ["p", "r", "r"]
 """,
     # The 4d63 shape with a sparse read map: only two tests read BACKUP's other
-    # key, so the alive leg (< 5) refuses the collapse.
+    # key, so the alive leg (< 3, W2j) refuses the collapse.
     "keyread-whole-sparse": """\
 diff --git a/sqlglot/consts.py b/sqlglot/consts.py
 --- a/sqlglot/consts.py

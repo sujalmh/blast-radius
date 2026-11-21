@@ -83,7 +83,8 @@ Selection rules (v1, pure functions of the above maps — no patch-specific stat
       - L3 (optional, ONLY when ALL hold, evaluated in calibration before enabling): the
         changed line is a dict/tuple/list literal entry; the constant's usage-kind is
         "keyable"; the changed key/index was read by ZERO tests; the SAME constant has other
-        keys read by ≥ 5 tests (proxy proven alive). Then drop L1 to just the tests reading
+        keys read by ≥ 3 tests (proxy proven alive; three distinct reader tests are
+        sufficient evidence the trace records reads). Then drop L1 to just the tests reading
         any key of that constant (or to empty if none) — the mutation is unreachable.
   - a symbol spanning the whole file (module) → treat as module-level change.
   - changed old-lines that intersect top-level Import/ImportFrom statements, or the file is
