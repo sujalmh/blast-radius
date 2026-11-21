@@ -1,0 +1,8 @@
+diff --git a/sqlglot/mod.py b/sqlglot/mod.py
+index 1111111..2222222 100644
+--- a/sqlglot/mod.py
++++ b/sqlglot/mod.py
+@@ -7,1 +7,1 @@ def alpha(x):
+-    return x + WEEK_OFFSET + METADATA["a"]
+-    return x
++    return x

@@ -1,0 +1,7 @@
+diff --git a/tests/fixtures/a.sql b/tests/fixtures/a.sql
+index 6666666..7777777 100644
+--- a/tests/fixtures/a.sql
++++ b/tests/fixtures/a.sql
+@@ -1,1 +1,1 @@
+-SELECT 1;
++SELECT 2;

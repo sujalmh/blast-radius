@@ -1,0 +1,7 @@
+diff --git a/sqlglot/mod.py b/sqlglot/mod.py
+index 1111111..3333333 100644
+--- a/sqlglot/mod.py
++++ b/sqlglot/mod.py
+@@ -11,1 +11,1 @@ class Helper:
+-    LIMIT = 3
++    LIMIT = 4

@@ -1,0 +1,7 @@
+diff --git a/sqlglot/other.py b/sqlglot/other.py
+index 4444444..5555555 100644
+--- a/sqlglot/other.py
++++ b/sqlglot/other.py
+@@ -3,1 +3,1 @@
+-    "b": 2,
++    "b": 3,
