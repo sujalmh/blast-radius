@@ -103,6 +103,7 @@ import io
 import json
 import os
 import pathlib
+import pickle
 import sys
 
 import pytest
@@ -755,7 +756,18 @@ def _br_task(test_id, fn, *args, **kwargs):
         except Exception:  # noqa: BLE001 - tracing must not break the task
             pass
     try:
-        return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        # The pool pickles the result *after* this wrapper returns, i.e. outside
+        # the switched coverage context; ``Expression.__reduce__`` runs
+        # ``sqlglot.serde.dump`` there, which would lose serde.py coverage for
+        # every pool-driven test.  Force that serialisation now, inside the
+        # attributed context.  A result the pool cannot pickle is harmless here
+        # (the pool would fail on it anyway); swallow and let it through.
+        try:
+            pickle.dumps(result)
+        except Exception:  # noqa: BLE001 - never break the task over tracing
+            pass
+        return result
     finally:
         if coverage_instance is not None:
             try:

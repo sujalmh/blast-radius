@@ -121,7 +121,9 @@ python3 bench/probe.py --maps /tmp/br1c cover-lines \
      monkeypatches `ProcessPoolExecutor.submit` so every task becomes
      `submit(_br_task, current_test_id, fn, …)`; `_br_task` (module-level, so
      spawn can pickle it by qualname) sets the worker's current test, calls
-     `Coverage.current().switch_context(test_id)`, runs `fn`, and the worker
+     `Coverage.current().switch_context(test_id)`, runs `fn`, `pickle.dumps` the
+     result inside that context (so `Expression.__reduce__` → `serde.dump` is
+     covered; the pool's own later pickling is outside it), and the worker
      writes its dialect/key trace to `/work/dynamic.json.<pid>.child.json`
      (plus a line in `/work/dynamic.json.children.log`). Workers are
      instrumented from interpreter startup by `br_trace_boot.py`, installed
