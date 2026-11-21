@@ -102,8 +102,10 @@ Fallback ladder (Tier E = full suite): unknown/risky shapes. It costs ~29 s; a m
   nintervals × (`u32 start_line`, `u32 run_len`)) with 1-based inclusive runs, sorted by line.
 - `maps/symbols.json.gz` — `{"sqlglot/...": [["qualname", start, end, "function"|"class"], ...]}`.
 - `maps/usage.json.gz` — `{"sqlglot/...": {"NAME": [line, ...]}}` for every name assigned at
-  module or class body level: lines anywhere in sqlglot/ referencing `NAME` (Name.id or
-  Attribute.attr equal to NAME).
+  module or class body level: same-file reference lines. Cross-file references live in the
+  companion `maps/usage_refs.json.gz` — `{"NAME": {"sqlglot/...": [line, ...]}}` — and the
+  selector unions the two (a name's uses can live in another module, e.g. a constant defined
+  in `time.py` and read in `dialects/dialect.py`).
 - `maps/fixtures.json.gz` — `{"tests/fixtures/...": ["test id", ...]}`,
   plus `"__test_files__": {"tests/test_x.py": ["test id", ...]}` and
   `"__shared__": ["tests/helpers.py", "conftest.py", ...]` (import-shared test support files).
