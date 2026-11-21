@@ -15,6 +15,13 @@ The v2 maps (``dialects.json.gz``, ``keyreads.json.gz``, ``testimports.json.gz``
 are strictly optional refinements: a missing or malformed file disables the
 corresponding narrowing rule and degrades to the unrefined selection.  The
 large one (``keyreads``) is only opened when a rule actually asks for it.
+
+The L4 maps (``classes.json.gz``: per-test instantiated expression classes plus
+the class hierarchy; ``usage_style.json.gz``: per-name reference lines split
+into ``self``/``cls``-style reads and everything else) are optional in exactly
+the same way: when either file is missing, unreadable, or the construction trace
+covers less than 90% of the committed test index, L4 is disabled with a warning
+and the L1 rule is used unchanged.
 """
 
 from __future__ import annotations
@@ -36,6 +43,11 @@ class MapsError(RuntimeError):
 
 # Max distance (in lines) between a queried line and a selected test's coverage.
 BLOCK_LINES = 4
+
+# L4 (class-attribute narrowing) needs these maps and a construction trace that
+# covers at least this share of the committed test index.
+CLASS_MAP_FILES = ("classes.json.gz", "usage_style.json.gz")
+CLASS_COVERAGE_SHARE = 9  # per-mille-free form: touched * 10 >= index * 9
 
 _COVERAGE_MAGIC = b"BRcov1"
 _U16 = struct.Struct(">H")
@@ -410,6 +422,137 @@ def _collect_literal_entries(
     return tuple(entries)
 
 
+def _class_module_names(file: str) -> tuple[str, ...]:
+    """Module spellings a class defined in ``file`` can be qualified with.
+
+    ``sqlglot/expressions/ddl.py`` yields ``sqlglot.expressions.ddl`` and the
+    package form ``sqlglot.expressions`` (the spelling a construction tracer
+    records for classes reached through the package's re-exports).
+    """
+    without = file[: -len(".py")] if file.endswith(".py") else file
+    parts = [part for part in without.split("/") if part]
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    if not parts:
+        return ()
+    names = [".".join(parts)]
+    if len(parts) > 1:
+        names.append(".".join(parts[:-1]))
+    return tuple(dict.fromkeys(names))
+
+
+def _class_spellings(file: str, qualname: str) -> tuple[str, ...]:
+    """Every module-qualified spelling of ``qualname`` defined in ``file``."""
+    return tuple(
+        f"{module}.{qualname}" for module in _class_module_names(file) if module
+    )
+
+
+class _ClassGraph:
+    """Construction + inheritance graph over ``classes.json.gz``.
+
+    Nodes are canonical spellings: a class is addressable both as
+    ``sqlglot.expressions.ddl.TriggerProperties`` (file-derived) and as
+    ``sqlglot.expressions.TriggerProperties`` (package re-export form), and the
+    symbol table folds both spellings onto one node, so the tracer's spelling
+    and the selector's spelling always meet.
+    """
+
+    def __init__(
+        self,
+        hierarchy: dict,
+        touched: dict,
+        spans: dict[str, tuple[str, int, int]],
+        alias: dict[str, str],
+        unique_paths: dict[str, str],
+    ) -> None:
+        self.spans = spans
+        self._alias = alias
+        self._unique_paths = unique_paths
+        self._edges: dict[str, set[str]] = {}
+        self.touched: dict[str, frozenset[str]] = {}
+        self._ancestry: dict[str, frozenset[str]] = {}
+        self._descendants: dict[frozenset[str], frozenset[str]] = {}
+
+        for key, bases in hierarchy.items():
+            if not isinstance(key, str):
+                continue
+            node = self.resolve(key) or key
+            bucket = self._edges.setdefault(node, set())
+            if not isinstance(bases, (list, tuple)):
+                continue
+            for base in bases:
+                if isinstance(base, str):
+                    bucket.add(self.resolve(base) or base)
+
+        collected: dict[str, set[str]] = {}
+        for test_id, classes in touched.items():
+            if not isinstance(test_id, str) or not isinstance(classes, (list, tuple)):
+                continue
+            for spelling in classes:
+                if not isinstance(spelling, str):
+                    continue
+                node = self.resolve(spelling) or spelling
+                collected.setdefault(node, set()).add(str(test_id))
+        self.touched = {node: frozenset(ids) for node, ids in collected.items()}
+
+        self.nodes = frozenset(self.spans) | frozenset(self._edges) | frozenset(
+            self.touched
+        )
+
+    # -- resolution ------------------------------------------------------
+
+    def resolve(self, spelling: str) -> str | None:
+        """Canonical node for ``spelling``: known form, else a unique class path."""
+        canonical = self._alias.get(spelling)
+        if canonical is not None:
+            return canonical
+        parts = spelling.split(".")
+        for index in range(1, len(parts)):
+            target = self._unique_paths.get(".".join(parts[index:]))
+            if target is not None:
+                return target
+        return None
+
+    def mentioned(self, node: str) -> bool:
+        """True when the class maps actually know ``node``.
+
+        A class can sit in the symbol table without ever appearing in
+        ``classes.json.gz`` (no test constructs it and no hierarchy entry names
+        it); such a class is *foreign* to L4 and the caller keeps L1.
+        """
+        return node in self.touched or node in self._edges
+
+    # -- hierarchy -------------------------------------------------------
+
+    def ancestry(self, node: str) -> frozenset[str]:
+        """``node`` plus every class it inherits from (transitively)."""
+        cached = self._ancestry.get(node)
+        if cached is not None:
+            return cached
+        found = {node}
+        stack = [node]
+        while stack:
+            for base in self._edges.get(stack.pop(), ()):
+                if base not in found:
+                    found.add(base)
+                    stack.append(base)
+        result = frozenset(found)
+        self._ancestry[node] = result
+        return result
+
+    def descendants(self, targets: Iterable[str]) -> frozenset[str]:
+        """``targets`` plus every node inheriting from any of them."""
+        key = frozenset(targets)
+        cached = self._descendants.get(key)
+        if cached is not None:
+            return cached
+        found = {node for node in self.nodes if self.ancestry(node) & key}
+        result = frozenset(found | key)
+        self._descendants[key] = result
+        return result
+
+
 class Maps:
     """All committed maps, loaded from one directory."""
 
@@ -444,6 +587,13 @@ class Maps:
         self._dialects_raw: dict | None = None
         self._keyreads_raw: dict | None = None
         self._testimports_raw: dict | None = None
+        self._classes_raw: dict | None = None
+        self._usage_style_raw: dict | None = None
+        self._classes_ok: bool | None = None
+        self._class_graph_cache: _ClassGraph | None = None
+        self._class_graph_built = False
+        self._l4_noted = False
+        self._usage_style_present = (self.root / "usage_style.json.gz").is_file()
         self._shared: frozenset[str] | None = None
         self._tar: tarfile.TarFile | None = None
         self._tar_unavailable = False
@@ -462,6 +612,12 @@ class Maps:
         self._keyread_index: dict[str, dict[str, list[str]]] | None = None
         self._keyread_reads_cache: dict[str, dict[str, frozenset[str]]] = {}
         self._import_share_cache: dict[str, float | None] = {}
+
+        # L4 is map-gated: report the degraded state as early as possible so the
+        # entry point's startup warning log always carries it.
+        missing = [name for name in CLASS_MAP_FILES if not (self.root / name).is_file()]
+        if missing:
+            self._note_l4_disabled(f"{', '.join(missing)} missing")
 
     # -- lifecycle -------------------------------------------------------
 
@@ -537,6 +693,20 @@ class Maps:
         if self._testimports_raw is None:
             self._testimports_raw = self._optional_json("testimports.json.gz", quiet=True)
         return self._testimports_raw
+
+    def _classes(self) -> dict:
+        """``classes.json.gz`` (L4): per-test constructed classes + hierarchy."""
+        if self._classes_raw is None:
+            self._classes_raw = self._optional_json("classes.json.gz", quiet=True)
+        return self._classes_raw
+
+    def _usage_style(self) -> dict:
+        """``usage_style.json.gz`` (L4): name -> file -> self/other reference lines."""
+        if self._usage_style_raw is None:
+            self._usage_style_raw = self._optional_json(
+                "usage_style.json.gz", quiet=True
+            )
+        return self._usage_style_raw
 
     # -- symbols ---------------------------------------------------------
 
@@ -853,6 +1023,154 @@ class Maps:
         share = hits / len(table)
         self._import_share_cache[module] = share
         return share
+
+    # -- class attributes (L4) -------------------------------------------
+
+    def _note_l4_disabled(self, reason: str) -> None:
+        """Record (once) that the L4 class-attribute rule is unavailable."""
+        if self._l4_noted:
+            return
+        self._l4_noted = True
+        self.warnings.append(
+            f"{reason}: L4 class-attribute narrowing disabled"
+        )
+
+    def has_classes(self) -> bool:
+        """True when the class maps can carry L4.
+
+        A construction trace that misses tests would silently drop the tests
+        that build the mutated class, so a trace covering less than 90% of the
+        committed test index disables the rule exactly like a missing file
+        (MAPS_SPEC: the dialect-narrowing degrade discipline).
+        """
+        if self._classes_ok is not None:
+            return self._classes_ok
+        document = self._classes()
+        touched = document.get("touched")
+        hierarchy = document.get("hierarchy")
+        ok = bool(
+            isinstance(touched, dict)
+            and touched
+            and isinstance(hierarchy, dict)
+            and self._usage_style_present
+            and len(touched) * 10 >= len(self._test_ids) * CLASS_COVERAGE_SHARE
+        )
+        if not ok:
+            self._note_l4_disabled("classes.json.gz unusable or partial")
+        self._classes_ok = ok
+        return ok
+
+    def _class_graph(self) -> _ClassGraph | None:
+        """Build (once) the spellings/hierarchy/construction graph, or ``None``."""
+        if self._class_graph_built:
+            return self._class_graph_cache
+        self._class_graph_built = True
+        document = self._classes()
+        touched = document.get("touched")
+        hierarchy = document.get("hierarchy")
+        if not isinstance(touched, dict) or not isinstance(hierarchy, dict):
+            return None
+
+        spans: dict[str, tuple[str, int, int]] = {}
+        alias: dict[str, str] = {}
+        paths: dict[str, set[str]] = {}
+        for file, entries in self._symbols().items():
+            if not isinstance(entries, list):
+                continue
+            modules = _class_module_names(str(file))
+            if not modules:
+                continue
+            for entry in entries:
+                try:
+                    qualname, start, end, kind = entry
+                except (TypeError, ValueError):
+                    continue
+                if str(kind) != "class":
+                    continue
+                canonical = f"{modules[0]}.{qualname}"
+                spans.setdefault(canonical, (str(file), int(start), int(end)))
+                for module in modules:
+                    alias.setdefault(f"{module}.{qualname}", canonical)
+                paths.setdefault(str(qualname), set()).add(canonical)
+
+        # A bare class path is only an alias when exactly one class owns it;
+        # ``Tokenizer`` and friends stay module-qualified.
+        unique = {
+            path: next(iter(found))
+            for path, found in paths.items()
+            if len(found) == 1
+        }
+        self._class_graph_cache = _ClassGraph(hierarchy, touched, spans, alias, unique)
+        return self._class_graph_cache
+
+    def usage_style(self, name: str) -> dict:
+        """``{file: {"self_lines": [...], "other_lines": [...]}}`` for ``name``."""
+        entry = self._usage_style().get(name)
+        if not isinstance(entry, dict):
+            return {}
+        result: dict[str, dict] = {}
+        for file, detail in entry.items():
+            if isinstance(detail, dict):
+                result[str(file)] = detail
+        return result
+
+    def _ids_for_ordinals(self, ordinals: Iterable[int]) -> set[str]:
+        ids = self._test_ids
+        count = len(ids)
+        return {ids[ordinal] for ordinal in ordinals if 0 <= ordinal < count}
+
+    def classattr_tests(self, file: str, qualname: str, name: str) -> set[str] | None:
+        """L4: test ids that can observe ``qualname.name`` being changed in ``file``.
+
+        ``None`` means "unresolvable": the class is absent from
+        ``classes.json.gz`` (or from the symbol table), so the caller must keep
+        the L1 usage rule for that name.
+
+        The set is
+          * tests constructing the class or any descendant (recorded trace),
+          * tests covering a *non*-instance reference line of ``name``
+            (``dialect.WEEK_OFFSET``-style qualified reads), and
+          * tests covering any symbol span of the class or a descendant
+            (a method body may read the attribute without the test ever
+            constructing the class directly).
+        ``self``/``cls``-style reads contribute nothing: they only execute on
+        instances of the class or a descendant, which the first term already
+        covers.
+        """
+        graph = self._class_graph()
+        if graph is None:
+            return None
+        targets: list[str] = []
+        for spelling in _class_spellings(file, qualname):
+            node = graph.resolve(spelling)
+            if node is not None and graph.mentioned(node) and node not in targets:
+                targets.append(node)
+        if not targets:
+            return None
+        descendants = graph.descendants(targets)
+
+        ids: set[str] = set()
+        for node in descendants:
+            ids.update(graph.touched.get(node, ()))
+
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for node in descendants:
+            span = graph.spans.get(node)
+            if span is not None:
+                spans.setdefault(span[0], []).append((span[1], span[2]))
+        for span_file, ranges in spans.items():
+            ids.update(self._ids_for_ordinals(self.covering_tests(span_file, ranges)))
+
+        for style_file, detail in self.usage_style(name).items():
+            lines = detail.get("other_lines")
+            if not isinstance(lines, list) or not lines:
+                continue
+            ids.update(
+                self._ids_for_ordinals(
+                    self.covering_tests(style_file, [int(line) for line in lines])
+                )
+            )
+        return ids or None
 
     # -- pinned source: imports and literal entries ----------------------
 

@@ -1,0 +1,6 @@
+diff --git a/sqlglot/mod.py b/sqlglot/mod.py
+--- a/sqlglot/mod.py
++++ b/sqlglot/mod.py
+@@ -1,1 +1,1 @@
+-from sqlglot.other import METADATA
++from sqlglot.other import METADATA, EXTRA

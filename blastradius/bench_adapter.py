@@ -11,8 +11,8 @@ what the submission image runs::
     result["tier_e"]  # -> bool (full suite)
     result["workers"] # -> [[numbers]] when durations were supplied, else None
 
-Knob values are the four documented axes (``symbol``, ``classbody``,
-``dialect``, ``keyreads``); unknown keys are ignored and reported in ``notes``
+Knob values are the documented axes (``symbol``, ``classbody``, ``dialect``,
+``keyreads``, ``l4``); unknown keys are ignored and reported in ``notes``
 so a harness bug never becomes a crash.
 """
 

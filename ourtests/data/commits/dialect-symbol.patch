@@ -1,0 +1,6 @@
+diff --git a/sqlglot/dialects/duck.py b/sqlglot/dialects/duck.py
+--- a/sqlglot/dialects/duck.py
++++ b/sqlglot/dialects/duck.py
+@@ -17,1 +17,1 @@ class Duck:
+-        return x + self.TOKENS["a"]
++        return x + self.TOKENS["b"]

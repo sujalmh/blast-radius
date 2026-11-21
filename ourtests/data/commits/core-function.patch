@@ -1,0 +1,6 @@
+diff --git a/sqlglot/core.py b/sqlglot/core.py
+--- a/sqlglot/core.py
++++ b/sqlglot/core.py
+@@ -5,1 +5,1 @@ def bump(x):
+-    return x + VERSION
++    return x + VERSION + 1

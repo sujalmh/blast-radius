@@ -1,0 +1,8 @@
+diff --git a/sqlglot/expr.py b/sqlglot/expr.py
+--- a/sqlglot/expr.py
++++ b/sqlglot/expr.py
+@@ -2,3 +2,3 @@ class Expression:
+     ARG_TYPES = {
+-        "this": True,
++        "this": False,
+     }

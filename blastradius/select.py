@@ -12,6 +12,14 @@ import-region edits and ``sqlglot/__init__.py``.
 The v2 refinements (dialect exposure, key reads, test imports) are optional:
 every one of them is skipped when its map file is absent, which degrades to the
 unrefined, recall-safe selection instead of failing.
+
+L4 (class-attribute narrowing) refines a *class-body assignment* of ``NAME``
+inside class ``C``: for that name, the L1 usage set is replaced by tests that
+construct ``C`` or a descendant, tests covering a non-``self``/``cls`` reference
+of ``NAME``, and tests covering a symbol span of ``C`` or a descendant.
+Instance-style reads add nothing (they only run on instances the first term
+already covers).  Unresolvable classes keep L1; a missing/partial
+``classes.json.gz`` disables the rule with a warning.
 """
 
 from __future__ import annotations
@@ -47,6 +55,7 @@ class Knobs:
     classbody: str = "usage"  # "usage" | "all" | "off"
     dialect: str = "on"  # "on" | "off"
     keyreads: str = "on"  # "on" | "off"
+    l4: str = "on"  # "on" | "off"  (class-attribute narrowing)
 
     def normalized(self) -> "Knobs":
         symbol = self.symbol if self.symbol in ("innermost", "all") else "innermost"
@@ -57,7 +66,8 @@ class Knobs:
             classbody = "usage"
         dialect = "off" if self.dialect is False or self.dialect == "off" else "on"
         keyreads = "off" if self.keyreads is False or self.keyreads == "off" else "on"
-        return Knobs(symbol, classbody, dialect, keyreads)
+        l4 = "off" if self.l4 is False or self.l4 == "off" else "on"
+        return Knobs(symbol, classbody, dialect, keyreads, l4)
 
 
 DEFAULT_KNOBS = Knobs()
@@ -366,6 +376,31 @@ def _usage_ids(
     return result
 
 
+def _classattr_ids(
+    maps: Maps,
+    symbols: Sequence[Symbol],
+    path: str,
+    name: str,
+    lines: Iterable[int],
+) -> set[str] | None:
+    """L4: sound narrowing for a class-body attribute assignment of ``name``.
+
+    Returns the replacement for L1 for that single name, or ``None`` when the
+    change cannot be attributed to a resolvable class (module-level line, a
+    class the maps do not know): the caller then keeps L1 unchanged.
+    """
+    combined: set[str] | None = None
+    for line in sorted(lines):
+        classes = _enclosing_classes(symbols, line)
+        if not classes:
+            return None  # module-level: not a class attribute
+        ids = maps.classattr_tests(path, classes[0].qualname, name)
+        if ids is None:
+            return None
+        combined = ids if combined is None else combined | ids
+    return combined or None
+
+
 def _apply_sqlglot(
     file_patch: FilePatch,
     path: str,
@@ -507,24 +542,33 @@ def _apply_sqlglot(
             if chosen is not None:
                 collapses[name] = chosen
 
-        if collapses:
-            for name, ids in collapses.items():
-                parts.append(("keyread", f"{name}: {len(ids)} readers", ids))
-            remaining = [name for name in sorted(assigned) if name not in collapses]
-            if remaining:
-                parts.append(
-                    (
-                        "usage",
-                        ",".join(remaining),
-                        set().union(*(usage[name] for name in remaining)),
-                    )
-                )
-        else:
+        classattr: dict[str, set[str]] = {}
+        if (
+            knobs.l4 == "on"
+            and any(_enclosing_classes(symbols, line) for line in broad_lines)
+            and maps.has_classes()
+        ):
+            for name in sorted(assigned):
+                if name in collapses:
+                    continue
+                ids = _classattr_ids(maps, symbols, path, name, assigned[name])
+                if ids is not None:
+                    classattr[name] = ids
+
+        for name, ids in collapses.items():
+            parts.append(("keyread", f"{name}: {len(ids)} readers", ids))
+        for name, ids in classattr.items():
+            parts.append(("classattr", f"{name}: {len(ids)} tests", ids))
+
+        remaining = [
+            name for name in sorted(assigned) if name not in collapses and name not in classattr
+        ]
+        if remaining or not (collapses or classattr):
             parts.append(
                 (
                     "usage",
-                    ",".join(sorted(assigned)) if assigned else "no assigned names",
-                    set().union(*usage.values()) if usage else set(),
+                    ",".join(remaining) if remaining else "no assigned names",
+                    set().union(*(usage[name] for name in remaining)) if remaining else set(),
                 )
             )
 

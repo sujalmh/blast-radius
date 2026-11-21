@@ -1,0 +1,8 @@
+diff --git a/sqlglot/dialects/crane.py b/sqlglot/dialects/crane.py
+--- a/sqlglot/dialects/crane.py
++++ b/sqlglot/dialects/crane.py
+@@ -2,3 +2,3 @@
+     SPANS = {
+-        "a": 1,
++        "a": 2,
+     }

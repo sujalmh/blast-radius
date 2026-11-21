@@ -1,0 +1,6 @@
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -19,1 +19,1 @@
+-BY_TOKEN = {TokenType.SELECT: 1, TokenType.INSERT: 2}
++BY_TOKEN = {TokenType.SELECT: 1, TokenType.INSERT: 3}

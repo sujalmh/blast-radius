@@ -1,0 +1,6 @@
+diff --git a/sqlglot/lonely.py b/sqlglot/lonely.py
+--- a/sqlglot/lonely.py
++++ b/sqlglot/lonely.py
+@@ -2,1 +2,1 @@ class Lonely:
+-    TAG = {"a": 1}
++    TAG = {"a": 2}

@@ -1,0 +1,8 @@
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -28,3 +28,3 @@ class Registry:
+         "p": 1,
+-        "q": 2,
++        "q": 3,
+     }

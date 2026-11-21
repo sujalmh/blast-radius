@@ -296,7 +296,8 @@ def test_missing_v2_maps_keep_the_unrefined_rules(tmp_path):
         assert numbers == {0, 2, 3, 6}
         _, numbers = _select("keyread-collapse", maps, index)
         assert numbers == {0, 1, 2, 3, 4, 5}
-        assert maps.warnings == []
+        # The only warning is the expected L4 degrade (no class maps here).
+        assert not [w for w in maps.warnings if "L4" not in w]
     finally:
         maps.close()
 

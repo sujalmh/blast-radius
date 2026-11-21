@@ -1,0 +1,6 @@
+diff --git a/sqlglot/core.py b/sqlglot/core.py
+--- a/sqlglot/core.py
++++ b/sqlglot/core.py
+@@ -1,1 +1,1 @@
+-VERSION = 1
++VERSION = 2

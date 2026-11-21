@@ -1,0 +1,7 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,2 @@
++def helper():
++    return 1

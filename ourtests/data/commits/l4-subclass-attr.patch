@@ -1,0 +1,9 @@
+diff --git a/sqlglot/expr.py b/sqlglot/expr.py
+--- a/sqlglot/expr.py
++++ b/sqlglot/expr.py
+@@ -12,4 +12,4 @@ class Trigger(Expression):
+     ARG_TYPES = {
+         "timing": True,
+-        "constraint": False,
++        "constraint": True,
+     }

@@ -23,8 +23,11 @@ SOURCE_FILES = (
     "sqlglot/__init__.py",
     "sqlglot/consts.py",
     "sqlglot/core.py",
+    "sqlglot/dialects/crane.py",
     "sqlglot/dialects/duck.py",
     "sqlglot/dialects/gander.py",
+    "sqlglot/expr.py",
+    "sqlglot/lonely.py",
     "sqlglot/mod.py",
     "sqlglot/other.py",
 )
@@ -100,6 +103,27 @@ SYMBOLS = {
     "sqlglot/dialects/gander.py": [["Gander", 4, 5, "class"]],
     # 1 VERSION, 4-5 bump.
     "sqlglot/core.py": [["bump", 4, 5, "function"]],
+    # L4 fixtures: Expression.validate reads self.ARG_TYPES (generic base-class
+    # read, covered by every test); Trigger/TriggerChild are its subclasses.
+    "sqlglot/expr.py": [
+        ["Expression", 1, 8, "class"],
+        ["Expression.validate", 6, 8, "function"],
+        ["Trigger", 11, 18, "class"],
+        ["Trigger.render", 17, 18, "function"],
+        ["TriggerChild", 21, 22, "class"],
+        ["build_trigger", 25, 26, "function"],
+    ],
+    # 1-5 class Lonely, 8-9 peek (the non-instance TAG read).
+    "sqlglot/lonely.py": [
+        ["Lonely", 1, 5, "class"],
+        ["Lonely.show", 4, 5, "function"],
+        ["peek", 8, 9, "function"],
+    ],
+    # 1-7 class Crane (dialect-scoped L4 case), 6-7 Crane.span.
+    "sqlglot/dialects/crane.py": [
+        ["Crane", 1, 7, "class"],
+        ["Crane.span", 6, 7, "function"],
+    ],
     "sqlglot/__init__.py": [],
 }
 
@@ -127,6 +151,12 @@ USAGE = {
         "OFFSET": [14],
     },
     "sqlglot/core.py": {"VERSION": [5]},
+    # Definition lines are included on purpose: the selector must drop them.
+    "sqlglot/expr.py": {
+        "ARG_TYPES": [2, 7, 12, 18, 22, 26],
+    },
+    "sqlglot/lonely.py": {"TAG": [2, 5]},
+    "sqlglot/dialects/crane.py": {"SPANS": [2, 7]},
 }
 
 FIXTURES = {    "tests/fixtures/a.sql": ["tests/test_mod.py::test_beta"],
@@ -160,21 +190,69 @@ TEST_IDS_ORDINAL = [test["id"] for test in TESTS]
 # v2 maps (handcrafted, same formats as tools/mapgen writes).
 DIALECTS = {
     "exposure": {
-        TEST_IDS_ORDINAL[0]: ["duck"],
+        TEST_IDS_ORDINAL[0]: ["duck", "crane"],
         TEST_IDS_ORDINAL[1]: ["default"],
-        TEST_IDS_ORDINAL[2]: ["default"],
+        TEST_IDS_ORDINAL[2]: ["default", "crane"],
         TEST_IDS_ORDINAL[3]: ["duck", "default"],
         TEST_IDS_ORDINAL[4]: ["duck"],
         TEST_IDS_ORDINAL[5]: ["default"],
         TEST_IDS_ORDINAL[6]: ["gander"],
     },
     "file_scope": {
+        "sqlglot/dialects/crane.py": "crane",
         "sqlglot/dialects/duck.py": "duck",
         "sqlglot/dialects/gander.py": "gander",
     },
     "class_scope": {
+        "sqlglot/dialects/crane.py": {"Crane": "crane"},
         "sqlglot/dialects/duck.py": {"Duck": "duck"},
         "sqlglot/dialects/gander.py": {"Gander": "gander"},
+    },
+}
+
+# L4 maps (formats in MAPS_SPEC.md; the mock spells classes both ways on
+# purpose: module-qualified in ``touched``, package-qualified in ``hierarchy``).
+CLASSES = {
+    "touched": {
+        TEST_IDS_ORDINAL[0]: [
+            "sqlglot.expr.Expression",
+            "sqlglot.lonely.Lonely",
+            "sqlglot.dialects.crane.Crane",
+        ],
+        TEST_IDS_ORDINAL[1]: ["sqlglot.expr.Trigger"],
+        TEST_IDS_ORDINAL[2]: ["sqlglot.expr.Trigger"],
+        TEST_IDS_ORDINAL[3]: ["sqlglot.expr.Expression"],
+        TEST_IDS_ORDINAL[4]: [
+            "sqlglot.expr.TriggerChild",
+            "sqlglot.dialects.crane.Crane",
+        ],
+        TEST_IDS_ORDINAL[5]: ["sqlglot.expr.Expression", "sqlglot.lonely.Lonely"],
+        TEST_IDS_ORDINAL[6]: ["sqlglot.TriggerChild"],
+    },
+    "hierarchy": {
+        "sqlglot.expr.Expression": [],
+        "sqlglot.expr.Trigger": ["sqlglot.expr.Expression"],
+        "sqlglot.TriggerChild": ["sqlglot.expr.Trigger"],
+        "sqlglot.lonely.Lonely": [],
+        "sqlglot.dialects.crane.Crane": [],
+    },
+}
+
+# L4: reference lines of a name split into instance-style (``self``/``cls``) and
+# everything else.  ``TAG`` is deliberately absent (constructors + class spans
+# only); ``SPANS`` has no non-instance reads at all.
+USAGE_STYLE = {
+    "ARG_TYPES": {
+        "sqlglot/expr.py": {
+            "self_lines": [7, 18],
+            "other_lines": [26],
+        },
+    },
+    "SPANS": {
+        "sqlglot/dialects/crane.py": {
+            "self_lines": [7],
+            "other_lines": [],
+        },
     },
 }
 
@@ -262,6 +340,21 @@ COVERAGE = {
     ],
     "sqlglot/core.py": [(0, [(4, 2)])],
     "sqlglot/dialects/gander.py": [(6, [(5, 1)])],
+    # L4: every test executes Expression.validate (the generic self.ARG_TYPES
+    # read); only test_beta/test_extra run Trigger.render; test_gesundheit runs
+    # the module-level static read; test_gamma covers Crane.span.
+    "sqlglot/expr.py": [
+        (0, [(6, 3)]),
+        (1, [(6, 3), (17, 2)]),
+        (2, [(6, 3)]),
+        (3, [(6, 3)]),
+        (4, [(6, 3), (17, 2)]),
+        (5, [(6, 3)]),
+        (6, [(6, 3), (25, 2)]),
+    ],
+    # test_metadata runs Lonely.show; test_gamma reads Lonely.TAG statically.
+    "sqlglot/lonely.py": [(2, [(9, 1)]), (3, [(4, 2)])],
+    "sqlglot/dialects/crane.py": [(2, [(6, 2)]), (4, [(6, 2)])],
 }
 
 PATCHES = {
@@ -459,6 +552,46 @@ new file mode 100644
 +def helper():
 +    return 1
 """,
+    # -- L4 class-attribute scenarios --------------------------------------
+    "l4-subclass-attr": """\
+diff --git a/sqlglot/expr.py b/sqlglot/expr.py
+--- a/sqlglot/expr.py
++++ b/sqlglot/expr.py
+@@ -12,4 +12,4 @@ class Trigger(Expression):
+     ARG_TYPES = {
+         "timing": True,
+-        "constraint": False,
++        "constraint": True,
+     }
+""",
+    "l4-base-attr": """\
+diff --git a/sqlglot/expr.py b/sqlglot/expr.py
+--- a/sqlglot/expr.py
++++ b/sqlglot/expr.py
+@@ -2,3 +2,3 @@ class Expression:
+     ARG_TYPES = {
+-        "this": True,
++        "this": False,
+     }
+""",
+    "l4-missing-usage": """\
+diff --git a/sqlglot/lonely.py b/sqlglot/lonely.py
+--- a/sqlglot/lonely.py
++++ b/sqlglot/lonely.py
+@@ -2,1 +2,1 @@ class Lonely:
+-    TAG = {"a": 1}
++    TAG = {"a": 2}
+""",
+    "l4-dialect": """\
+diff --git a/sqlglot/dialects/crane.py b/sqlglot/dialects/crane.py
+--- a/sqlglot/dialects/crane.py
++++ b/sqlglot/dialects/crane.py
+@@ -2,3 +2,3 @@
+     SPANS = {
+-        "a": 1,
++        "a": 2,
+     }
+""",
 }
 
 # Selected test numbers per synthetic commit (Tier E includes every test).
@@ -488,6 +621,15 @@ EXPECTATIONS = {
     "shared-module": {0, 1, 2, 3, 4, 5, 6},
     "core-function": {0},
     "new-conftest": {0, 1, 2, 3, 4, 5, 6},
+    # L4: constructors of Trigger/TriggerChild (1, 2, 4) + the static
+    # Trigger.ARG_TYPES read (6); the generic self.ARG_TYPES read is not enough.
+    "l4-subclass-attr": {1, 2, 4, 6},
+    # A base class every test instantiates: no wrong narrowing at all.
+    "l4-base-attr": {0, 1, 2, 3, 4, 5, 6},
+    # TAG is absent from usage_style: constructors + Lonely's symbol spans.
+    "l4-missing-usage": {0, 3, 5},
+    # L4 = {0, 2, 4}; only crane-exposed tests survive dialect narrowing.
+    "l4-dialect": {0, 2},
 }
 
 
@@ -561,6 +703,8 @@ def build_maps(target: Path | str, with_v2: bool = True) -> Path:
         _write_gz_json(target / "dialects.json.gz", DIALECTS)
         _write_gz_json(target / "keyreads.json.gz", KEYREADS)
         _write_gz_json(target / "testimports.json.gz", TESTIMPORTS)
+        _write_gz_json(target / "classes.json.gz", CLASSES)
+        _write_gz_json(target / "usage_style.json.gz", USAGE_STYLE)
     manifest = {
         "pin": "mock",
         "sqlglot_sha1": {

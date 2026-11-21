@@ -1,0 +1,8 @@
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -33,3 +33,3 @@
+     "one",
+-    "two",
++    "three",
+ }
