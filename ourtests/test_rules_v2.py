@@ -12,7 +12,13 @@ import pytest
 from blastradius.bench_adapter import bench_adapter
 from blastradius.maps_io import Maps
 from blastradius.patch import parse_patch
-from blastradius.select import Knobs, TestIndex, select_commit
+from blastradius.select import (
+    Knobs,
+    TestIndex,
+    _changed_container_keys,
+    _rewrite_successors,
+    select_commit,
+)
 from ourtests import mockmaps
 
 
@@ -210,6 +216,82 @@ def test_keyread_collapse_supports_set_membership(loaded):
     selection, numbers = _select("keyread-set", maps, index)
     assert numbers == {0, 1, 2, 3, 4}
     assert "keyread" in {hit.rule for hit in selection.rules}
+
+
+def test_keyread_collapse_reads_a_whole_container_rewrite(loaded):
+    """W2i: the 4d63 shape -- one line holding the WHOLE dict literal.
+
+    ``WHOLE = {"a": 1, "b": 2, "c": 3}`` -> ``... "b": 9 ...`` changes exactly
+    one value, so L3 must use ``"b"`` (zero readers) and collapse to the readers
+    of the other keys.  Before W2i the changed line was not a *fragment*, so the
+    extractor bailed out and the whole 6-test L1 union was kept.
+    """
+    maps, index = loaded
+    assert maps.literal_entry_at("sqlglot/consts.py", 39) == ("WHOLE", "dict", "a", None)
+    selection, numbers = _select("keyread-whole-dict", maps, index)
+    assert numbers == {0, 1, 2, 3, 4}
+    assert "keyread" in {hit.rule for hit in selection.rules}
+    # L1 alone (knob off) is the full six.
+    _, plain = _select("keyread-whole-dict", maps, index, Knobs(keyreads="off"))
+    assert plain == {0, 1, 2, 3, 4, 5}
+
+
+def test_keyread_whole_container_index_key(loaded):
+    maps, index = loaded
+    assert maps.literal_entry_at("sqlglot/consts.py", 42) == (
+        "ORDERED",
+        "list",
+        "0",
+        0,
+    )
+    selection, numbers = _select("keyread-whole-index", maps, index)
+    assert numbers == {0, 1, 2, 3, 4}
+    assert "keyread" in {hit.rule for hit in selection.rules}
+
+
+@pytest.mark.parametrize(
+    "patch_name",
+    [
+        "keyread-whole-two",  # two values changed: not one key
+        "keyread-whole-keyset",  # the key set changed
+        "keyread-whole-unparseable",  # the new line is not a container
+        "keyread-whole-sparse",  # too few tests read the other keys (4d63's shape)
+    ],
+)
+def test_keyread_whole_container_refusals_keep_l1(loaded, patch_name):
+    maps, index = loaded
+    selection, numbers = _select(patch_name, maps, index)
+    assert numbers == {0, 1, 2, 3, 4, 5}
+    assert "keyread" not in {hit.rule for hit in selection.rules}
+    assert "usage" in {hit.rule for hit in selection.rules}
+
+
+def test_changed_container_keys_refuses_mixed_kinds():
+    """A dict -> list rewrite is not one key of one constant (pure function)."""
+    assert _changed_container_keys(
+        'X = {"a": 1, "b": 2}', 'X = ["a", "b"]'
+    ) is None
+    assert _changed_container_keys(
+        'X = {"a": 1, "b": 2}', 'X = {"a": 1, "b": 2}'
+    ) is None
+    # A set has no positions: a member swap changes two keys (both returned).
+    assert _changed_container_keys('X = {"a", "b"}', 'X = {"a", "c"}') == (
+        "set",
+        ("a", "b"),
+        ("b", "c"),
+    )
+
+
+def test_whole_container_rewrite_needs_one_removed_and_one_added_line():
+    """A multi-line block is not a line rewrite, so L3 stays unavailable."""
+    (file_patch,) = parse_patch(
+        _one_file(
+            "sqlglot/consts.py",
+            '@@ -39,1 +39,2 @@\n-WHOLE = {"a": 1, "b": 2, "c": 3}\n'
+            '+WHOLE = {"a": 1, "b": 9, "c": 3}\n+X = 1\n',
+        )
+    )
+    assert _rewrite_successors(file_patch.hunks[0]) == {}
 
 
 @pytest.mark.parametrize(

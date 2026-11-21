@@ -35,6 +35,13 @@ Three W2f refinements sit on top:
   lines are inside one body narrows to the tests covering those exact lines
   (``+/-1`` pad) intersected with the symbol-span tests; signature, insertion,
   deleted-statement-head and empty-coverage shapes fall back to the span.
+
+W2i extends the L3 changed-key extraction: a hunk that rewrites a WHOLE
+container literal on one source line (``NAME = {...}`` -> the same ``NAME`` with
+one new value, the snowflake ``NUMERIC_ESCAPES`` shape) is compared
+structurally against the pinned entry.  The same key/index set with exactly one
+changed value names the changed key; a key-set change, two changed values, a
+different container kind or an unparseable line yields no key and L1 is kept.
 """
 
 from __future__ import annotations
@@ -401,6 +408,175 @@ def _dialect_scope(
     return maps.dialect_file_scope(path)
 
 
+def _rewrite_successors(hunk: Hunk) -> dict[int, str]:
+    """Old line -> the single ``+`` line that rewrites it (1:1 change blocks).
+
+    Only a change block that removes exactly one line and adds exactly one line
+    is a line rewrite -- the whole-container shape (``NAME = {...}`` -> a new
+    ``NAME = {...}`` on one source line).  Every other shape (pure insertion, a
+    multi-line block, mismatched counts) pairs nothing, so the container
+    comparison stays unavailable and the L3 rule keeps L1.
+    """
+    pairs: dict[int, str] = {}
+    cursor = hunk.old_start
+    removed: list[tuple[int, str]] = []
+    added: list[str] = []
+
+    def flush() -> None:
+        if len(removed) == 1 and len(added) == 1:
+            pairs[removed[0][0]] = added[0]
+        removed.clear()
+        added.clear()
+
+    for body in hunk.body:
+        if body.startswith("\\"):
+            continue
+        if body.startswith("-"):
+            removed.append((cursor, body[1:]))
+            cursor += 1
+            continue
+        if body.startswith("+"):
+            added.append(body[1:])
+            continue
+        flush()
+        if body.startswith(" ") or body == "":
+            cursor += 1
+    flush()
+    return pairs
+
+
+def _parse_container(text: str) -> tuple[str, ast.AST] | None:
+    """Parse one patch line as a *whole* container literal -> ``(kind, node)``.
+
+    Two shapes are accepted: a one-line assignment (``NAME = {...}`` /
+    ``NAME: T = {...}``, the shape the assignment map records) and a bare
+    container expression.  A fragment of a longer literal, a call, an
+    unparseable line -- anything that is not exactly one dict/list/tuple/set --
+    returns ``None`` (MAPS_SPEC: "if it does not parse -> do not apply").
+    """
+    snippet = text.strip()
+    if not snippet:
+        return None
+    node: ast.AST | None = None
+    try:
+        module = ast.parse(snippet)
+    except (SyntaxError, ValueError):
+        module = None
+    if module is not None and len(module.body) == 1:
+        statement = module.body[0]
+        if isinstance(statement, ast.Assign):
+            targets, value = statement.targets, statement.value
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets, value = [statement.target], statement.value
+        else:
+            targets, value = [], None
+        if len(targets) == 1 and isinstance(targets[0], ast.Name):
+            node = value
+    if node is None:
+        candidate = snippet[:-1].strip() if snippet.endswith(",") else snippet
+        try:
+            node = ast.parse(candidate, mode="eval").body
+        except (SyntaxError, ValueError):
+            return None
+    kind = {
+        ast.Dict: "dict",
+        ast.List: "list",
+        ast.Tuple: "tuple",
+        ast.Set: "set",
+    }.get(type(node))
+    return None if kind is None else (kind, node)
+
+
+def _changed_container_keys(
+    old_text: str, new_text: str
+) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    """``(kind, all keys, changed keys)`` of a one-line container rewrite.
+
+    Both lines must parse as the *same* container kind, keep the same key/index
+    set (same order for dicts), and differ in the value of exactly one entry --
+    the only shape in which the mutation is attributable to one key.  A key-set
+    change, two changed entries, a different container kind, an unrenderable
+    (enum/attribute) key or an unparseable line is refused: the caller keeps L1.
+    """
+    old = _parse_container(old_text)
+    new = _parse_container(new_text)
+    if old is None or new is None or old[0] != new[0]:
+        return None
+    kind, old_node = old
+    new_node = new[1]
+
+    if kind == "dict":
+        old_keys, new_keys = old_node.keys, new_node.keys
+        if (
+            len(old_keys) != len(new_keys)
+            or any(key is None for key in old_keys)
+            or any(key is None for key in new_keys)
+        ):
+            return None
+        if [ast.dump(key) for key in old_keys] != [
+            ast.dump(key) for key in new_keys
+        ]:
+            return None
+        rendered = tuple(_constant_key(key) for key in old_keys)
+        if any(text is None for text in rendered):
+            return None
+        changed = [
+            index
+            for index, (before, after) in enumerate(
+                zip(old_node.values, new_node.values)
+            )
+            if ast.dump(before) != ast.dump(after)
+        ]
+        if len(changed) != 1 or len(set(rendered)) != len(rendered):
+            return None
+        return kind, rendered, (rendered[changed[0]],)
+
+    if kind in ("list", "tuple"):
+        if len(old_node.elts) != len(new_node.elts):
+            return None
+        changed = [
+            index
+            for index, (before, after) in enumerate(
+                zip(old_node.elts, new_node.elts)
+            )
+            if ast.dump(before) != ast.dump(after)
+        ]
+        if len(changed) != 1:
+            return None
+        keys = tuple(str(index) for index in range(len(old_node.elts)))
+        return kind, keys, (keys[changed[0]],)
+
+    # A set is unordered: changing one member is one removal plus one addition,
+    # so both the removed and the added member's keys are changed (the caller
+    # requires BOTH to have zero readers).
+    if len(old_node.elts) != len(new_node.elts):
+        return None
+    old_nodes = _unique_by_dump(old_node.elts)
+    new_nodes = _unique_by_dump(new_node.elts)
+    removed = tuple(node for dump, node in old_nodes.items() if dump not in new_nodes)
+    added = tuple(node for dump, node in new_nodes.items() if dump not in old_nodes)
+    if len(removed) != 1 or len(added) != 1:
+        return None
+    rendered = tuple(_constant_key(node) for node in old_node.elts)
+    if any(text is None for text in rendered):
+        return None
+    keys: list[str] = []
+    for node in (removed[0], added[0]):
+        text = _constant_key(node)
+        if text is None:
+            return None
+        keys.append(text)
+    return kind, rendered, tuple(keys)
+
+
+def _unique_by_dump(nodes: Sequence[ast.AST]) -> dict[str, ast.AST]:
+    """``ast.dump`` -> node (first wins); duplicate members make the map short."""
+    unique: dict[str, ast.AST] = {}
+    for node in nodes:
+        unique.setdefault(ast.dump(node), node)
+    return unique
+
+
 def _fragment_keys(text: str) -> tuple[tuple[str, str | None], ...]:
     """Parse one patch line as a literal entry: candidate ``(kind, key text)``.
 
@@ -448,12 +624,27 @@ def _keyread_collapse(
     line: int,
     text: str,
     knobs: Knobs,
+    successor: str | None = None,
 ) -> set[str] | None:
-    """L3: collapse one name's L1 selection to its key-readers, or ``None``."""
+    """L3: collapse one name's L1 selection to its key-readers, or ``None``.
+
+    Two shapes identify the changed key:
+
+    * a *single-entry fragment* line (``"b": 2,``) -- the pre-W2i shape; the
+      fragment is cross-checked against the pinned AST entry;
+    * a *whole-container rewrite* (``successor`` set: the one ``+`` line that
+      replaces this ``-`` line on the same source line), compared structurally:
+      same container kind, same key/index set, exactly one changed value.  A key
+      set change, two changed values, a different kind or an unparseable line
+      refuses the narrowing and keeps L1.
+    """
     if knobs.keyreads != "on" or not maps.has_keyreads():
         return None
     candidates = _fragment_keys(text)
-    if not candidates:
+    if not candidates and successor is None:
+        # Neither a literal fragment nor a one-line container rewrite: bail out
+        # before touching the pinned source (this is the hot path for ordinary
+        # class-body assignments).
         return None
     entry = maps.literal_entry_at(path, line)
     if entry is None:
@@ -461,21 +652,39 @@ def _keyread_collapse(
     entry_name, entry_kind, entry_key, entry_index = entry
     if entry_name != name:
         return None
-    fragment = next(
-        (key for kind, key in candidates if kind == entry_kind), _MISSING
-    )
-    if fragment is _MISSING:
-        return None
-    if entry_kind in ("dict", "set"):
-        # Cross-check the fragment against the pinned AST; a constant key must
-        # match exactly, and undefined (enum/attribute) keys stay ambiguous.
-        if fragment is None or fragment != entry_key:
+
+    changed: tuple[str, ...]
+    if candidates:
+        fragment = next(
+            (key for kind, key in candidates if kind == entry_kind), _MISSING
+        )
+        if fragment is _MISSING:
             return None
-        key = fragment
+        if entry_kind in ("dict", "set"):
+            # Cross-check the fragment against the pinned AST; a constant key
+            # must match exactly, and undefined (enum/attribute) keys stay
+            # ambiguous.
+            if fragment is None or fragment != entry_key:
+                return None
+            changed = (fragment,)
+        else:
+            if entry_index is None:
+                return None
+            changed = (str(entry_index),)
+    elif successor is not None:
+        comparison = _changed_container_keys(text, successor)
+        if comparison is None:
+            return None
+        kind, keys, changed = comparison
+        if kind != entry_kind:
+            return None
+        if entry_kind in ("dict", "set"):
+            if entry_key is None or entry_key not in keys:
+                return None
+        elif entry_index is None or str(entry_index) not in keys:
+            return None
     else:
-        if entry_index is None:
-            return None
-        key = str(entry_index)
+        return None
 
     classes = _enclosing_classes(symbols, line)
     qualified = f"{classes[0].qualname}.{name}" if classes else name
@@ -484,11 +693,12 @@ def _keyread_collapse(
     reads = maps.keyread_reads(qualified)
     if not reads:
         return None
-    if reads.get(key):
-        return None  # the changed key has readers: the mutation is reachable
+    for key in changed:
+        if reads.get(key):
+            return None  # a changed key has readers: the mutation is reachable
     alive: set[str] = set()
     for other_key, ids in reads.items():
-        if other_key != key:
+        if other_key not in changed:
             alive.update(ids)
     if len(alive) < KEYREAD_ALIVE_TESTS:
         return None
@@ -578,6 +788,7 @@ def _apply_sqlglot(
     module_lines: set[int] = set()
     hunk_lines: list[int] = []
     removed: list[tuple[int, str]] = []
+    rewrites: dict[int, str] = {}
     source_text = maps.source_text(path) if knobs.line_bias == "on" else None
     body_starts: dict[int, int] | None = None
     if source_text is not None:
@@ -598,6 +809,7 @@ def _apply_sqlglot(
         hunk_lines.extend(old_lines)
         removed_texts = _removed_texts(hunk)
         removed.extend(removed_texts)
+        rewrites.update(_rewrite_successors(hunk))
         bias = (
             _line_bias_target(
                 hunk, symbols, dict(removed_texts), hunk.added, body_starts
@@ -724,7 +936,14 @@ def _apply_sqlglot(
                 if text is None:
                     continue
                 candidate = _keyread_collapse(
-                    maps, path, symbols, name, line, text, knobs
+                    maps,
+                    path,
+                    symbols,
+                    name,
+                    line,
+                    text,
+                    knobs,
+                    successor=rewrites.get(line),
                 )
                 if candidate is None:
                     continue

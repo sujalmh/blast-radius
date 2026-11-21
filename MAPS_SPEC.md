@@ -63,7 +63,14 @@ Selection rules (v1, pure functions of the above maps — no patch-specific stat
   tests/**.py that defines no numbered tests is treated as a fixture, not a test file.
   Unknown fixture → full suite (Tier E).
 - `TESTPY` file → all its tests; conftest/helpers-style files → full suite.
-- `SQLGLOT` hunk with old-line span S (old range of the hunk, incl. context lines):
+- `SQLGLOT` hunk with old-line span S: S is the hunk's old range (context lines included) for
+  SYMBOL and LINE-BIASED rules; for the class-body/module-level name ladder, the changed-line
+  set is the **AST statement extent of every removed (`-`) line** — context lines never
+  contribute names (they are byte-identical in old and new trees, so no failing test can be
+  affected through them), and a removed line deep inside a multi-line literal still collects
+  the literal's name via its enclosing statement. Pure insertions contribute no class-body
+  names (a new constant has no pinned readers); inserted CODE lines are handled by the anchor
+  and symbol rules as today.
   - select tests covering any line of every symbol (function/class) whose range intersects S;
   - **dialect narrowing** (applies to the symbol-level selection above when the changed
     symbol's file has a dialect scope D, and to L1 below): intersect with tests whose dialect
@@ -114,7 +121,22 @@ Fallback ladder (Tier E = full suite): unknown/risky shapes. It costs ~29 s; a m
 - `maps/keyreads.json.gz` — `{"exposure": {"test id": [["NAME", "KEY"], ...]},
   "usage_kind": {"sqlglot/...": {"NAME": "keyable"|"opaque"}}`.
 - `maps/testimports.json.gz` — `{"tests/test_x.py": ["sqlglot.module.path", ...]}` — the
-  transitive sqlglot modules a test file's top-level imports reach.
+  transitive sqlglot modules a test file's top-level imports reach (descends into test-support
+  modules like tests/dialects/test_dialect.py).
+- `maps/classes.json.gz` — `{"touched": {test id: ["sqlglot.expressions.X", ...]},
+  "hierarchy": {qualified class name: [qualified base names, ...]}}` — per test, the
+  expression classes it instantiates (trace wraps `Expr.__init__`; every overriding `__init__`
+  in sqlglot calls super, so one wrap is complete; `touched` includes the constructed class's
+  sqlglot ancestors; a key exists for every test id).
+- `maps/usage_style.json.gz` — `{"NAME": {"sqlglot/...": {"self_lines": [...],
+  "class_lines": [...], "instance_lines": [...]}}}` — reference lines split by receiver kind:
+  `self_lines` (receiver is `self`/`cls`), `class_lines` (receiver statically resolves to a
+  class or module, or it is a bare module-scope Name read), `instance_lines` (reads through
+  plain variables/parameters). L4 may ignore `self_lines`/`instance_lines` ONLY for class
+  families whose instance universe is captured — expression classes via `classes.touched`,
+  dialect classes via `dialects.exposure` (a read on an instance implies the instance was
+  created/resolved in that test). For any other family (Tokenizer/Parser/Generator class
+  bodies), `instance_lines` stays in the L4 union — instance creation is not traced there.
 - `maps/source.tar.gz` — tarball of `sqlglot/**/*.py` at the pin (member names as repo-relative
   paths). Read whole into memory via `tarfile` only when a comment-neutrality check is needed.
 - `maps/MANIFEST.json` — generation metadata: pinned sha, generator git state, per-file sha1s

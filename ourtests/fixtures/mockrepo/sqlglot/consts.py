@@ -33,3 +33,14 @@ SET_KEYWORDS = {
     "one",
     "two",
 }
+
+# W2i: whole-container literals on ONE line (the 4d63 shape).  The dict keeps
+# its keys on one line so a hunk rewrites the whole literal, not one entry.
+WHOLE = {"a": 1, "b": 2, "c": 3}
+
+# A one-line sequence: the changed key of an index rewrite is the index.
+ORDERED = ["p", "q", "r"]
+
+# W2i: a whole-container constant whose key-read proxy is too sparse (two
+# reader tests) to prove the constant is alive -- the L3 alive leg must refuse.
+BACKUP = {"a": 1, "b": 2}

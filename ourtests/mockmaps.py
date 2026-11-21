@@ -176,6 +176,9 @@ USAGE = {
         "BY_TOKEN": [23],
         "TABLE": [23],
         "SET_KEYWORDS": [23],
+        "WHOLE": [23],
+        "ORDERED": [23],
+        "BACKUP": [23],
     },
     "sqlglot/dialects/duck.py": {
         "TOKENS": [5, 17],
@@ -351,6 +354,9 @@ KEYREADS = {
             ["OPTIONS", "x"],
             ["SPARSE", "m"],
             ["Registry.TABLE", "p"],
+            ["WHOLE", "a"],
+            ["ORDERED", "0"],
+            ["BACKUP", "a"],
         ],
         TEST_IDS_ORDINAL[1]: [
             ["LIMITS", "a"],
@@ -358,24 +364,33 @@ KEYREADS = {
             ["OPTIONS", "x"],
             ["SPARSE", "m"],
             ["Registry.TABLE", "p"],
+            ["WHOLE", "a"],
+            ["ORDERED", "0"],
+            ["BACKUP", "a"],
         ],
         TEST_IDS_ORDINAL[2]: [
             ["LIMITS", "c"],
             ["SET_KEYWORDS", "one"],
             ["OPTIONS", "x"],
             ["Registry.TABLE", "p"],
+            ["WHOLE", "c"],
+            ["ORDERED", "2"],
         ],
         TEST_IDS_ORDINAL[3]: [
             ["LIMITS", "a"],
             ["SET_KEYWORDS", "one"],
             ["OPTIONS", "x"],
             ["Registry.TABLE", "p"],
+            ["WHOLE", "a"],
+            ["ORDERED", "0"],
         ],
         TEST_IDS_ORDINAL[4]: [
             ["LIMITS", "a"],
             ["SET_KEYWORDS", "one"],
             ["OPTIONS", "x"],
             ["Registry.TABLE", "p"],
+            ["WHOLE", "a"],
+            ["ORDERED", "0"],
         ],
         TEST_IDS_ORDINAL[5]: [],
     },
@@ -387,6 +402,9 @@ KEYREADS = {
             "BY_TOKEN": "opaque",
             "Registry.TABLE": "keyable",
             "SET_KEYWORDS": "keyable",
+            "WHOLE": "keyable",
+            "ORDERED": "keyable",
+            "BACKUP": "keyable",
         },
     },
 }
@@ -611,6 +629,62 @@ diff --git a/sqlglot/consts.py b/sqlglot/consts.py
 -        "q": 2,
 +        "q": 3,
      }
+""",
+    # W2i: a whole-container rewrite on ONE line (the 4d63 shape).  Both sides
+    # parse as the same dict; only "b"'s value changed, so L3 uses "b".
+    "keyread-whole-dict": """\
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -39,1 +39,1 @@
+-WHOLE = {"a": 1, "b": 2, "c": 3}
++WHOLE = {"a": 1, "b": 9, "c": 3}
+""",
+    # Two changed values: the mutation is not attributable to one key.
+    "keyread-whole-two": """\
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -39,1 +39,1 @@
+-WHOLE = {"a": 1, "b": 2, "c": 3}
++WHOLE = {"a": 1, "b": 9, "c": 9}
+""",
+    # Key-set change ("b" -> "d"): the old and new key sets differ.
+    "keyread-whole-keyset": """\
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -39,1 +39,1 @@
+-WHOLE = {"a": 1, "b": 2, "c": 3}
++WHOLE = {"a": 1, "d": 2, "c": 3}
+""",
+    # The new line does not parse as a container: no structural comparison.
+    "keyread-whole-unparseable": """\
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -39,1 +39,1 @@
+-WHOLE = {"a": 1, "b": 2, "c": 3}
++WHOLE = {"a": 1, "b": 2, "c": 3
+""",
+    # A one-line sequence: the changed position is the index key "1".
+    "keyread-whole-index": """\
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -42,1 +42,1 @@
+-ORDERED = ["p", "q", "r"]
++ORDERED = ["p", "r", "r"]
+""",
+    # The 4d63 shape with a sparse read map: only two tests read BACKUP's other
+    # key, so the alive leg (< 5) refuses the collapse.
+    "keyread-whole-sparse": """\
+diff --git a/sqlglot/consts.py b/sqlglot/consts.py
+--- a/sqlglot/consts.py
++++ b/sqlglot/consts.py
+@@ -46,1 +46,1 @@
+-BACKUP = {"a": 1, "b": 2}
++BACKUP = {"a": 1, "b": 9}
 """,
     "import-line": """\
 diff --git a/sqlglot/mod.py b/sqlglot/mod.py
@@ -874,6 +948,15 @@ EXPECTATIONS = {
     "keyread-ambiguous": {0, 1, 2, 3, 4, 5},
     "keyread-class-qualified": {0, 1, 2, 3, 4},
     "keyread-set": {0, 1, 2, 3, 4},
+    # W2i whole-container rewrites: exactly one changed entry collapses to that
+    # constant's key readers; every other shape keeps L1 (all six).
+    "keyread-whole-dict": {0, 1, 2, 3, 4},
+    "keyread-whole-index": {0, 1, 2, 3, 4},
+    "keyread-whole-two": {0, 1, 2, 3, 4, 5},
+    "keyread-whole-keyset": {0, 1, 2, 3, 4, 5},
+    "keyread-whole-unparseable": {0, 1, 2, 3, 4, 5},
+    # ... and the alive leg: two reader tests prove nothing (< 5), so L1 stays.
+    "keyread-whole-sparse": {0, 1, 2, 3, 4, 5},
     # Import-region / package root / >80%-imported module / new conftest.
     "import-line": {0, 1, 2, 3, 4, 5, 6},
     "package-init": {0, 1, 2, 3, 4, 5, 6},
