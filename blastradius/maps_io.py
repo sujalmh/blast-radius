@@ -10,6 +10,11 @@ Coverage queries are answered from a block index: every ``BLOCK_LINES``-line
 block maps to a bitmask of test ordinals whose recorded runs touch it.  That
 over-approximates by at most ``BLOCK_LINES - 1`` lines (recall-safe) and keeps
 queries to a handful of integer ORs.
+
+The v2 maps (``dialects.json.gz``, ``keyreads.json.gz``, ``testimports.json.gz``)
+are strictly optional refinements: a missing or malformed file disables the
+corresponding narrowing rule and degrades to the unrefined selection.  The
+large one (``keyreads``) is only opened when a rule actually asks for it.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 import ast
 import gzip
 import json
+import re
 import struct
 import tarfile
 from dataclasses import dataclass
@@ -59,9 +65,44 @@ class Reference:
     line: int
 
 
+@dataclass(frozen=True)
+class LiteralEntry:
+    """A dict/list/tuple/set entry on a pinned source line (L3 input)."""
+
+    name: str
+    kind: str  # "dict" | "list" | "tuple" | "set"
+    key: str | None  # keyreads KEY form; None when it cannot be rendered
+    index: int | None
+    ambiguous: bool = False
+
+
 def _read_json_gz(path: Path) -> dict:
     with gzip.open(path, "rb") as handle:
         return json.loads(handle.read().decode("utf-8"))
+
+
+_BASE_CLASS = re.compile(r"^[ \t]*class\s+\w+\s*\(([^)]*)\)", re.MULTILINE)
+
+
+def _base_classes(text: str) -> Iterable[str]:
+    """Base class names of every ``class X(...)`` in ``text`` (first component)."""
+    for match in _BASE_CLASS.finditer(text):
+        for part in match.group(1).split(","):
+            name = part.strip().split(".")[0].strip()
+            if name and name.isidentifier():
+                yield name
+
+
+def _key_text(node: ast.AST) -> str | None:
+    """Keyreads KEY form for a literal key node (``str`` for strings, repr otherwise).
+
+    ``None`` when the node is not a plain constant: the selector never guesses
+    at enum members / computed keys (the L3 gate then keeps L1).
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        return value if isinstance(value, str) else repr(value)
+    return None
 
 
 def _query_ranges(queries: Iterable[int | tuple[int, int]]):
@@ -242,6 +283,133 @@ def _collect_assignments(tree: ast.AST) -> tuple[tuple[int, int, tuple[str, ...]
     return tuple(spans)
 
 
+def _collect_import_spans(tree: ast.AST) -> tuple[tuple[int, int], ...]:
+    """Spans of module-level ``import`` / ``from ... import`` statements."""
+    spans: list[tuple[int, int]] = []
+    for statement in getattr(tree, "body", []):
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            start = int(statement.lineno)
+            end = int(getattr(statement, "end_lineno", start) or start)
+            spans.append((start, end))
+    return tuple(spans)
+
+
+def _collect_literal_entries(
+    tree: ast.AST,
+) -> tuple[tuple[int, int, str, str, str | None, int | None, bool], ...]:
+    """Literal entries (``start, end, name, kind, key, index, ambiguous``).
+
+    Only module/class-body ``dict``/``list``/``tuple``/``set`` literals are
+    recorded: those are the constants the key-read map proxies.  ``key`` is the
+    keyreads KEY form for dict entries with constant / enum-attribute keys and
+    ``None`` otherwise; ``index`` is the element position for sequences.
+    """
+
+    def target_names(targets: Sequence[ast.AST]) -> set[str]:
+        names: set[str] = set()
+
+        def visit(node: ast.AST) -> None:
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for element in node.elts:
+                    visit(element)
+            elif isinstance(node, ast.Starred):
+                visit(node.value)
+
+        for target in targets:
+            visit(target)
+        return names
+
+    entries: list[tuple[int, int, str, str, str | None, int | None, bool]] = []
+
+    def start_line(node: ast.AST) -> int | None:
+        line = getattr(node, "lineno", None)
+        return None if line is None else int(line)
+
+    def end_line(node: ast.AST, fallback: int) -> int:
+        line = getattr(node, "end_lineno", None)
+        return fallback if line is None else int(line)
+
+    def record(name: str, value: ast.AST) -> None:
+        if not name:
+            return
+        if isinstance(value, ast.Dict):
+            keys = [
+                (key, item)
+                for key, item in zip(value.keys, value.values)
+                if key is not None
+            ]
+            rendered = [_key_text(key) for key, _ in keys]
+            duplicates = {
+                text
+                for text in rendered
+                if text is not None and rendered.count(text) > 1
+            }
+            for (key, item), text in zip(keys, rendered):
+                first = start_line(key)
+                if first is None:
+                    first = start_line(item)
+                if first is None:
+                    continue
+                last = end_line(item, first)
+                ambiguous = text is None or text in duplicates
+                entries.append((first, last, name, "dict", text, None, ambiguous))
+            return
+        kind = {
+            ast.List: "list",
+            ast.Tuple: "tuple",
+            ast.Set: "set",
+        }.get(type(value))
+        if kind is None:
+            return
+        for index, element in enumerate(value.elts):
+            first = start_line(element)
+            if first is None:
+                continue
+            last = end_line(element, first)
+            if kind == "set":
+                # A set is membership-only: the keyreads KEY is the *value*
+                # tested by ``in``, i.e. the element itself.
+                text = _key_text(element)
+                entries.append((first, last, name, kind, text, None, text is None))
+                continue
+            entries.append((first, last, name, kind, str(index), index, False))
+
+    def visit_body(body: Sequence[ast.stmt]) -> None:
+        for statement in body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(statement, ast.ClassDef):
+                # Class bodies are where the key-read proxies live; nested
+                # functions inside them are still excluded above.
+                visit_body(statement.body)
+                continue
+            names: set[str] = set()
+            value: ast.AST | None = None
+            if isinstance(statement, ast.Assign):
+                names = target_names(statement.targets)
+                value = statement.value
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                names = target_names([statement.target])
+                value = statement.value
+            if value is not None:
+                for name in sorted(names):
+                    record(name, value)
+            nested = getattr(statement, "body", None)
+            if isinstance(nested, list):
+                visit_body(nested)
+            for handler in getattr(statement, "handlers", ()) or ():
+                visit_body(handler.body)
+            for field in ("orelse", "finalbody"):
+                child = getattr(statement, field, None)
+                if isinstance(child, list):
+                    visit_body(child)
+
+    visit_body(getattr(tree, "body", []))
+    return tuple(entries)
+
+
 class Maps:
     """All committed maps, loaded from one directory."""
 
@@ -259,6 +427,7 @@ class Maps:
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise MapsError(f"cannot read {index_path}: {error}") from error
         self._test_ids: list[str] = ids
+        self._test_id_set: frozenset[str] | None = None
 
         coverage_path = self.root / "coverage.bin.gz"
         try:
@@ -272,12 +441,27 @@ class Maps:
         self._usage_raw: dict | None = None
         self._usage_refs_raw: dict | None = None
         self._fixtures_raw: dict | None = None
+        self._dialects_raw: dict | None = None
+        self._keyreads_raw: dict | None = None
+        self._testimports_raw: dict | None = None
         self._shared: frozenset[str] | None = None
         self._tar: tarfile.TarFile | None = None
         self._tar_unavailable = False
         self._source_cache: dict[str, bytes | None] = {}
         self._text_cache: dict[str, str | None] = {}
         self._assignments_cache: dict[str, tuple[tuple[int, int, tuple[str, ...]], ...]] = {}
+        self._definition_lines_cache: dict[str, dict[int, frozenset[str]]] = {}
+        self._import_spans_cache: dict[str, tuple[tuple[int, int], ...]] = {}
+        self._literal_entries_cache: dict[
+            str, tuple[tuple[int, int, str, str, str | None, int | None, bool], ...]
+        ] = {}
+        self._exposure_cache: dict[str, frozenset[str]] = {}
+        self._family_cache: dict[str, frozenset[str]] = {}
+        self._inheritance: dict[str, set[str]] | None = None
+        self._name_files_cache: dict[str, tuple[str, ...]] | None = None
+        self._keyread_index: dict[str, dict[str, list[str]]] | None = None
+        self._keyread_reads_cache: dict[str, dict[str, frozenset[str]]] = {}
+        self._import_share_cache: dict[str, float | None] = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -299,14 +483,21 @@ class Maps:
 
     # -- optional JSON maps ---------------------------------------------
 
-    def _optional_json(self, filename: str) -> dict:
+    def _optional_json(self, filename: str, quiet: bool = False) -> dict:
         path = self.root / filename
         try:
-            return _read_json_gz(path)
+            document = _read_json_gz(path)
         except (OSError, ValueError) as error:
-            if filename != "usage_refs.json.gz":  # optional cross-file extension
+            # usage_refs and the v2 maps are optional refinements: a missing
+            # file must not even warn (it is the normal, degraded state).
+            if not quiet and filename != "usage_refs.json.gz":
                 self.warnings.append(f"{filename}: {error}")
             return {}
+        if not isinstance(document, dict):
+            if not quiet:
+                self.warnings.append(f"{filename}: expected a JSON object")
+            return {}
+        return document
 
     def _symbols(self) -> dict:
         if self._symbols_raw is None:
@@ -328,6 +519,24 @@ class Maps:
         if self._fixtures_raw is None:
             self._fixtures_raw = self._optional_json("fixtures.json.gz")
         return self._fixtures_raw
+
+    def _dialects(self) -> dict:
+        """``dialects.json.gz`` (v2): per-test exposure + file/class scope."""
+        if self._dialects_raw is None:
+            self._dialects_raw = self._optional_json("dialects.json.gz", quiet=True)
+        return self._dialects_raw
+
+    def _keyreads(self) -> dict:
+        """``keyreads.json.gz`` (v2): per-test key reads + static usage kinds."""
+        if self._keyreads_raw is None:
+            self._keyreads_raw = self._optional_json("keyreads.json.gz", quiet=True)
+        return self._keyreads_raw
+
+    def _testimports(self) -> dict:
+        """``testimports.json.gz`` (v2): test file -> transitive sqlglot modules."""
+        if self._testimports_raw is None:
+            self._testimports_raw = self._optional_json("testimports.json.gz", quiet=True)
+        return self._testimports_raw
 
     # -- symbols ---------------------------------------------------------
 
@@ -408,6 +617,296 @@ class Maps:
 
         references.sort(key=lambda reference: (reference.file, reference.line))
         return references
+
+    # -- dialects (v2) ---------------------------------------------------
+
+    def has_dialects(self) -> bool:
+        return bool(self._dialects().get("exposure"))
+
+    def _dialect_exposure(self) -> dict:
+        exposure = self._dialects().get("exposure")
+        return exposure if isinstance(exposure, dict) else {}
+
+    def dialect_file_scope(self, file: str) -> str | None:
+        scope = self._dialects().get("file_scope")
+        if not isinstance(scope, dict):
+            return None
+        value = scope.get(file)
+        return str(value) if isinstance(value, str) else None
+
+    def dialect_class_scope(self, file: str, qualname: str) -> str | None:
+        """Class scope for ``qualname``, walking outer classes (``A.B`` -> ``A``)."""
+        scope = self._dialects().get("class_scope")
+        if not isinstance(scope, dict):
+            return None
+        classes = scope.get(file)
+        if not isinstance(classes, dict):
+            return None
+        candidate = qualname
+        while candidate:
+            value = classes.get(candidate)
+            if isinstance(value, str):
+                return value
+            candidate = candidate.rpartition(".")[0]
+        return None
+
+    def _inheritance_edges(self) -> dict[str, set[str]]:
+        """``{base dialect key: {derived dialect key, ...}}`` from the pin.
+
+        Derived statically from the pinned sources: a test that resolves
+        ``spark`` exercises ``Hive`` code through the class hierarchy without
+        ever recording ``hive`` in its exposure, so dialect narrowing must keep
+        derived dialects in the family.
+        """
+        scope = self._dialects().get("file_scope")
+        if not isinstance(scope, dict):
+            return {}
+        owner_by_class: dict[str, set[str]] = {}
+        for file, key in scope.items():
+            if not isinstance(key, str):
+                continue
+            for symbol in self.symbols_of(file) or ():
+                if symbol.kind == "class" and "." not in symbol.qualname:
+                    owner_by_class.setdefault(symbol.qualname, set()).add(key)
+        edges: dict[str, set[str]] = {}
+        for file, key in scope.items():
+            if not isinstance(key, str):
+                continue
+            text = self.source_text(file)
+            if not text:
+                continue
+            for base in _base_classes(text):
+                for owner in owner_by_class.get(base, ()):
+                    if owner != key:
+                        edges.setdefault(owner, set()).add(key)
+        return edges
+
+    def dialect_family(self, dialect: str) -> frozenset[str]:
+        """``dialect`` plus every dialect key that inherits from it (transitive)."""
+        cached = self._family_cache.get(dialect)
+        if cached is not None:
+            return cached
+        if self._inheritance is None:
+            self._inheritance = self._inheritance_edges()
+        family = {dialect}
+        frontier = [dialect]
+        while frontier:
+            current = frontier.pop()
+            for child in self._inheritance.get(current, ()):
+                if child not in family:
+                    family.add(child)
+                    frontier.append(child)
+        result = frozenset(family)
+        self._family_cache[dialect] = result
+        return result
+
+    def tests_exposed_to_family(self, dialect: str) -> frozenset[str] | None:
+        """Tests exposed to ``dialect`` or to any dialect derived from it."""
+        family = self.dialect_family(dialect)
+        allowed: set[str] = set()
+        seen_map = False
+        for member in family:
+            exposed = self.tests_exposed_to(member)
+            if exposed is None:
+                continue
+            seen_map = True
+            allowed.update(exposed)
+        return frozenset(allowed) if seen_map else None
+
+    def tests_exposed_to(self, dialect: str) -> frozenset[str] | None:
+        """Test ids whose recorded dialect exposure includes ``dialect``.
+
+        Tests with no recorded exposure are treated as ``{"default"}``, so a
+        narrowly-exposed test can never be dropped by that accident.  ``None``
+        when the map is missing *or* only covers part of the committed test
+        index (a partial trace must not silently drop the untraced tests).
+        """
+        exposure = self._dialect_exposure()
+        if not exposure:
+            return None
+        if len(exposure) * 10 < len(self._test_ids) * 9:
+            self._note_partial_dialects()
+            return None
+        warmed = self._exposure_cache.get(dialect)
+        if warmed is not None:
+            return warmed
+        wanted = {dialect}
+        matched: set[str] = set()
+        for test, dialects in exposure.items():
+            if wanted & {str(item) for item in (dialects or ())}:
+                matched.add(str(test))
+        if dialect == "default":
+            # Tests absent from the map never resolved a dialect: "default".
+            matched.update(self._test_ids_set() - {str(test) for test in exposure})
+        result = frozenset(matched)
+        self._exposure_cache[dialect] = result
+        return result
+
+    def _test_ids_set(self) -> frozenset[str]:
+        if self._test_id_set is None:
+            self._test_id_set = frozenset(self._test_ids)
+        return self._test_id_set
+
+    def _note_partial_dialects(self) -> None:
+        if getattr(self, "_partial_dialects_noted", False):
+            return
+        self._partial_dialects_noted = True
+        self.warnings.append(
+            "dialects.json.gz covers a subset of tests_index.json: "
+            "dialect narrowing disabled"
+        )
+
+    # -- key reads (v2) --------------------------------------------------
+
+    def has_keyreads(self) -> bool:
+        return bool(self._keyreads().get("usage_kind"))
+
+    def name_usage_kind(self, file: str, name: str) -> str | None:
+        kinds = self._keyreads().get("usage_kind")
+        if not isinstance(kinds, dict):
+            return None
+        table = kinds.get(file)
+        if not isinstance(table, dict):
+            return None
+        kind = table.get(name)
+        return str(kind) if isinstance(kind, str) else None
+
+    def name_definition_files(self, name: str) -> tuple[str, ...]:
+        """Files whose ``usage_kind`` table names ``name`` (i.e. define it)."""
+        kinds = self._keyreads().get("usage_kind")
+        if not isinstance(kinds, dict):
+            return ()
+        if self._name_files_cache is None:
+            index: dict[str, list[str]] = {}
+            for file, table in kinds.items():
+                if not isinstance(table, dict):
+                    continue
+                for defined in table:
+                    index.setdefault(str(defined), []).append(str(file))
+            self._name_files_cache = {key: tuple(value) for key, value in index.items()}
+        return self._name_files_cache.get(name, ())
+
+    def name_is_fully_keyable(self, name: str) -> bool:
+        """True when every defining file classifies ``name`` as ``keyable``."""
+        files = self.name_definition_files(name)
+        if not files:
+            return False
+        for file in files:
+            if self.name_usage_kind(file, name) != "keyable":
+                return False
+        return True
+
+    def _build_keyread_index(self) -> dict[str, dict[str, list[str]]]:
+        index: dict[str, dict[str, list[str]]] = {}
+        exposure = self._keyreads().get("exposure")
+        if not isinstance(exposure, dict):
+            return index
+        for test_id, pairs in exposure.items():
+            if not isinstance(pairs, list):
+                continue
+            for pair in pairs:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                name = str(pair[0])
+                key = pair[1] if isinstance(pair[1], str) else str(pair[1])
+                entry = index.get(name)
+                if entry is None:
+                    entry = index[name] = {}
+                bucket = entry.get(key)
+                if bucket is None:
+                    entry[key] = [str(test_id)]
+                else:
+                    bucket.append(str(test_id))
+        return index
+
+    def keyread_reads(self, name: str) -> dict[str, frozenset[str]]:
+        """``{KEY: test ids}`` for every recorded read of ``name``."""
+        cached = self._keyread_reads_cache.get(name)
+        if cached is not None:
+            return cached
+        if self._keyread_index is None:
+            self._keyread_index = self._build_keyread_index()
+        raw = self._keyread_index.get(name, {})
+        reads = {key: frozenset(ids) for key, ids in raw.items()}
+        self._keyread_reads_cache[name] = reads
+        return reads
+
+    # -- test imports (v2) -----------------------------------------------
+
+    def test_file_count(self) -> int:
+        table = self._testimports()
+        return len(table) if isinstance(table, dict) else 0
+
+    def module_import_share(self, module: str) -> float | None:
+        """Fraction of test files whose transitive top-level imports reach ``module``."""
+        cached = self._import_share_cache.get(module)
+        if cached is not None or module in self._import_share_cache:
+            return cached
+        table = self._testimports()
+        if not isinstance(table, dict) or not table:
+            self._import_share_cache[module] = None
+            return None
+        hits = 0
+        for modules in table.values():
+            if isinstance(modules, list) and module in modules:
+                hits += 1
+        share = hits / len(table)
+        self._import_share_cache[module] = share
+        return share
+
+    # -- pinned source: imports and literal entries ----------------------
+
+    def _pinned_tree(self, file: str) -> ast.AST | None:
+        text = self.source_text(file)
+        if text is None:
+            return None
+        try:
+            return ast.parse(text)
+        except (SyntaxError, ValueError):
+            return None
+
+    def import_spans(self, file: str) -> tuple[tuple[int, int], ...]:
+        """Module-level import statement spans (empty when unparseable)."""
+        cached = self._import_spans_cache.get(file)
+        if cached is not None:
+            return cached
+        tree = self._pinned_tree(file)
+        spans = _collect_import_spans(tree) if tree is not None else ()
+        self._import_spans_cache[file] = spans
+        return spans
+
+    def literal_entries(
+        self, file: str
+    ) -> tuple[tuple[int, int, str, str, str | None, int | None, bool], ...]:
+        """Module/class-body literal entries of the pinned file."""
+        cached = self._literal_entries_cache.get(file)
+        if cached is not None:
+            return cached
+        tree = self._pinned_tree(file)
+        entries = _collect_literal_entries(tree) if tree is not None else ()
+        self._literal_entries_cache[file] = entries
+        return entries
+
+    def literal_entry_at(self, file: str, line: int) -> tuple[str, str, str | None, int | None] | None:
+        """Innermost literal entry spanning ``line`` -> ``(name, kind, key, index)``.
+
+        ``None`` when the line is not inside an unambiguous dict/list/tuple/set
+        entry (L3 then does not apply).  Duplicate dict keys are ambiguous and
+        report ``None`` as well.
+        """
+        best: tuple[int, int, str, str, str | None, int | None, bool] | None = None
+        for entry in self.literal_entries(file):
+            start, end = entry[0], entry[1]
+            if not (start <= line <= end):
+                continue
+            if best is None or (end - start) < (best[1] - best[0]):
+                best = entry
+        if best is None:
+            return None
+        _, _, name, kind, key, index, ambiguous = best
+        if ambiguous:
+            return None
+        return name, kind, key, index
 
     # -- fixtures / test files ------------------------------------------
 
@@ -518,3 +1017,31 @@ class Maps:
             if any(start <= line <= end for line in wanted):
                 names.update(assigned)
         return tuple(sorted(names))
+
+    def definition_names_at(self, file: str, line: int) -> frozenset[str]:
+        """Names whose module/class-level assignment covers ``line``.
+
+        Definition lines execute at import time, before any test is recording
+        coverage, so they are noise in a name's reference set (MAPS_SPEC v2).
+        """
+        index = self._definition_lines_cache.get(file)
+        if index is None:
+            index = {}
+            text = self.source_text(file)
+            if text is not None:
+                spans = self._assignments_cache.get(file)
+                if spans is None:
+                    try:
+                        tree = ast.parse(text)
+                    except SyntaxError:
+                        spans = ()
+                    else:
+                        spans = _collect_assignments(tree)
+                    self._assignments_cache[file] = spans
+                for start, end, assigned in spans:
+                    names = frozenset(assigned)
+                    for covered in range(start, end + 1):
+                        existing = index.get(covered)
+                        index[covered] = names if existing is None else existing | names
+            self._definition_lines_cache[file] = index
+        return index.get(line, frozenset())

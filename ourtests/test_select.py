@@ -79,12 +79,15 @@ def test_other_function_body(loaded):
     assert _numbers(_select(text, maps, index), index) == {2}
 
 
-def test_class_body_selects_all_file_symbols_plus_usage(loaded):
+def test_class_body_uses_usage_refs_only(loaded):
     maps, index = loaded
     selection = _select(mockmaps.PATCHES["class-body"], maps, index)
-    assert _numbers(selection, index) == {0, 1, 2, 5}
+    # Only the test covering LIMIT's reference line (self.LIMIT): the old
+    # "all symbols of the file" expansion is gone.
+    assert _numbers(selection, index) == {1}
     rules = {hit.rule for hit in selection.rules}
-    assert "usage" in rules and "coverage" in rules
+    assert "usage" in rules and "anchor" in rules
+    assert "classbody_all" not in rules
 
 
 def test_module_level_dict_uses_usage_lines(loaded):
@@ -119,13 +122,13 @@ def test_unknown_fixture_is_tier_e(loaded):
     )
     selection = _select(text, maps, index)
     assert selection.tier == "tier_e"
-    assert _numbers(selection, index) == set(range(6))
+    assert _numbers(selection, index) == set(mockmaps.number_by_id().values())
 
 
 def test_test_file_selects_its_tests(loaded):
     maps, index = loaded
     selection = _select(mockmaps.PATCHES["testpy"], maps, index)
-    assert _numbers(selection, index) == {3, 4}
+    assert _numbers(selection, index) == {3, 4, 6}
 
 
 def test_shared_test_support_is_tier_e(loaded):
@@ -190,8 +193,9 @@ def test_pure_insertion_uses_anchor_lines(loaded):
         "sqlglot/mod.py",
         "@@ -7,0 +8,1 @@\n+    x = 1\n",
     )
-    # Anchor lines 7 (alpha) and 8 (module level) -> broad module/class rule.
-    assert _numbers(_select(text, maps, index), index) == {0, 1, 2, 5}
+    # Anchor line 7 is inside alpha; line 8 is module level with no assigned
+    # name, so only the symbol coverage remains.
+    assert _numbers(_select(text, maps, index), index) == {0}
 
 
 def test_brand_new_file_selects_nothing(loaded):
@@ -244,7 +248,7 @@ def test_docs_only_change_selects_nothing(loaded):
     assert selection.tier == "code"
 
 
-def test_context_lines_can_widen_to_module_level(loaded):
+def test_context_lines_widen_only_with_assignments(loaded):
     maps, index = loaded
     text = _one_file(
         "sqlglot/mod.py",
@@ -256,7 +260,9 @@ def test_context_lines_can_widen_to_module_level(loaded):
         " \n"
         " \n",
     )
-    assert _numbers(_select(text, maps, index), index) == {0, 1, 2, 5}
+    # Context lines 5/8/9 are bare blank lines: no assigned name, so only the
+    # innermost-symbol coverage (alpha) remains.
+    assert _numbers(_select(text, maps, index), index) == {0}
 
 
 def test_selected_tests_missing_from_tests_json_are_dropped(loaded):

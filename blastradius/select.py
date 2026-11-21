@@ -1,4 +1,4 @@
-"""Selection rules v1 from MAPS_SPEC.md.
+"""Selection rules (v1 + the v2 refinements) from MAPS_SPEC.md.
 
 Pure functions over (parsed patch, loaded maps, test index).  Every decision
 appends a :class:`RuleHit` so the bench workstream can instrument which rule
@@ -6,21 +6,61 @@ fired; nothing here reads a patch-specific lookup table.
 
 Tier E (full suite) is the safety net for every shape we do not model
 confidently: binary patches, renames, deletes of sqlglot modules, unknown
-source files, hunks past the pinned file end, unknown fixtures/test files.
+source files, hunks past the pinned file end, unknown fixtures/test files,
+import-region edits and ``sqlglot/__init__.py``.
+
+The v2 refinements (dialect exposure, key reads, test imports) are optional:
+every one of them is skipped when its map file is absent, which degrades to the
+unrefined, recall-safe selection instead of failing.
 """
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 from . import neutral
 from .maps_io import Maps, Symbol
-from .patch import FilePatch
+from .patch import FilePatch, Hunk
 
 SQLGLOT_PREFIX = "sqlglot/"
 TESTS_PREFIX = "tests/"
 SHARED_BASENAMES = frozenset({"conftest.py", "helpers.py"})
+INIT_FILE = "sqlglot/__init__.py"
+
+# A module-level change in a module imported by more than this share of test
+# files is unbounded import-graph risk (MAPS_SPEC: "> 80%").
+IMPORT_SHARE_TIER_E = 0.8
+
+# L3 needs a proven-alive proxy: at least this many tests read *other* keys.
+KEYREAD_ALIVE_TESTS = 5
+
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class Knobs:
+    """Rule variants for calibration (defaults = the shipped configuration)."""
+
+    symbol: str = "innermost"  # "innermost" | "all"
+    classbody: str = "usage"  # "usage" | "all" | "off"
+    dialect: str = "on"  # "on" | "off"
+    keyreads: str = "on"  # "on" | "off"
+
+    def normalized(self) -> "Knobs":
+        symbol = self.symbol if self.symbol in ("innermost", "all") else "innermost"
+        classbody = self.classbody
+        if classbody is False or classbody == "off":
+            classbody = "off"
+        elif classbody not in ("usage", "all"):
+            classbody = "usage"
+        dialect = "off" if self.dialect is False or self.dialect == "off" else "on"
+        keyreads = "off" if self.keyreads is False or self.keyreads == "off" else "on"
+        return Knobs(symbol, classbody, dialect, keyreads)
+
+
+DEFAULT_KNOBS = Knobs()
 
 
 @dataclass(frozen=True)
@@ -46,11 +86,16 @@ class Selection:
     tests: set[str] = field(default_factory=set)
     rules: list[RuleHit] = field(default_factory=list)
     tier: str = "empty"
+    # rule name -> ids that rule contributed (after narrowing), for the bench
+    # adapter's per-rule provenance.
+    by_rule: dict[str, set[str]] = field(default_factory=dict)
 
     def add(self, ids: Iterable[str], rule: str, path: str = "", detail: str = "") -> int:
         before = len(self.tests)
-        self.tests.update(ids)
+        materialized = set(ids)
+        self.tests.update(materialized)
         self.rules.append(RuleHit(rule, path, detail))
+        self.by_rule.setdefault(rule, set()).update(materialized)
         return len(self.tests) - before
 
 
@@ -111,6 +156,17 @@ def _innermost(symbols: Sequence[Symbol], line: int) -> Symbol | None:
     return best
 
 
+def _enclosing_classes(symbols: Sequence[Symbol], line: int) -> tuple[Symbol, ...]:
+    """Class symbols containing ``line``, innermost first."""
+    found = [
+        symbol
+        for symbol in symbols
+        if symbol.kind == "class" and symbol.start <= line <= symbol.end
+    ]
+    found.sort(key=lambda symbol: (symbol.end - symbol.start, -symbol.start))
+    return tuple(found)
+
+
 def _tier_e(index: TestIndex, reason: str) -> Selection:
     return Selection(set(index.all_ids), [RuleHit("tier_e", detail=reason)], "tier_e")
 
@@ -132,21 +188,206 @@ def _file_is_neutral(file_patch: FilePatch, maps: Maps) -> bool:
     return neutral.is_neutral_file(text, file_patch)
 
 
+def _removed_lines(hunk: Hunk) -> list[int]:
+    """Old-side line numbers of the hunk's ``-`` lines (the changed lines)."""
+    lines: list[int] = []
+    cursor = hunk.old_start
+    for body in hunk.body:
+        if body.startswith("\\"):
+            continue
+        if body.startswith("+"):
+            continue
+        if body.startswith("-"):
+            lines.append(cursor)
+            cursor += 1
+            continue
+        if body.startswith(" ") or body == "":
+            cursor += 1
+    return lines
+
+
+def _removed_texts(hunk: Hunk) -> list[tuple[int, str]]:
+    """``(old line number, text)`` for the hunk's ``-`` lines."""
+    result: list[tuple[int, str]] = []
+    cursor = hunk.old_start
+    for body in hunk.body:
+        if body.startswith("\\"):
+            continue
+        if body.startswith("+"):
+            continue
+        if body.startswith("-"):
+            result.append((cursor, body[1:]))
+            cursor += 1
+            continue
+        if body.startswith(" ") or body == "":
+            cursor += 1
+    return result
+
+
+def _module_of(path: str) -> str:
+    """``sqlglot/a/b.py`` -> ``sqlglot.a.b``; ``.../__init__.py`` -> its package."""
+    without_suffix = path[: -len(".py")] if path.endswith(".py") else path
+    parts = without_suffix.split("/")
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _dialect_scope(
+    maps: Maps, path: str, symbols: Sequence[Symbol], lines: Iterable[int]
+) -> str | None:
+    """Dialect key scoping a change on ``lines`` (class scope first, then file)."""
+    for line in lines:
+        for symbol in _enclosing_classes(symbols, line):
+            scope = maps.dialect_class_scope(path, symbol.qualname)
+            if scope is not None:
+                return scope
+    return maps.dialect_file_scope(path)
+
+
+def _fragment_keys(text: str) -> tuple[tuple[str, str | None], ...]:
+    """Parse one patch line as a literal entry: candidate ``(kind, key text)``.
+
+    A line can be read several ways (``"a",`` is a list element *and* a set
+    element), so every interpretation is returned and the caller picks the one
+    matching the pinned AST.  Empty means the line is not a literal entry and
+    the L3 rule does not apply (MAPS_SPEC: "if it does not parse → do not
+    apply").  Only constant keys are rendered: enum/attribute keys cannot be
+    mapped to the recorded keyreads form without importing sqlglot.
+    """
+    snippet = text.strip()
+    if not snippet:
+        return ()
+    if snippet.endswith(","):
+        snippet = snippet[:-1].strip()
+    candidates: list[tuple[str, str | None]] = []
+    for wrapper, closing in (("{", "}"), ("[", "]"), ("(", ")")):
+        try:
+            node = ast.parse(f"{wrapper}{snippet}, {closing}", mode="eval").body
+        except SyntaxError:
+            continue
+        if isinstance(node, ast.Dict) and len(node.keys) == 1 and node.keys[0] is not None:
+            candidates.append(("dict", _constant_key(node.keys[0])))
+        elif isinstance(node, ast.Set) and len(node.elts) == 1:
+            candidates.append(("set", _constant_key(node.elts[0])))
+        elif isinstance(node, ast.List) and len(node.elts) == 1:
+            candidates.append(("list", None))
+        elif isinstance(node, ast.Tuple) and len(node.elts) == 1:
+            candidates.append(("tuple", None))
+    return tuple(candidates)
+
+
+def _constant_key(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant):
+        value = node.value
+        return value if isinstance(value, str) else repr(value)
+    return None
+
+
+def _keyread_collapse(
+    maps: Maps,
+    path: str,
+    symbols: Sequence[Symbol],
+    name: str,
+    line: int,
+    text: str,
+    knobs: Knobs,
+) -> set[str] | None:
+    """L3: collapse one name's L1 selection to its key-readers, or ``None``."""
+    if knobs.keyreads != "on" or not maps.has_keyreads():
+        return None
+    candidates = _fragment_keys(text)
+    if not candidates:
+        return None
+    entry = maps.literal_entry_at(path, line)
+    if entry is None:
+        return None
+    entry_name, entry_kind, entry_key, entry_index = entry
+    if entry_name != name:
+        return None
+    fragment = next(
+        (key for kind, key in candidates if kind == entry_kind), _MISSING
+    )
+    if fragment is _MISSING:
+        return None
+    if entry_kind in ("dict", "set"):
+        # Cross-check the fragment against the pinned AST; a constant key must
+        # match exactly, and undefined (enum/attribute) keys stay ambiguous.
+        if fragment is None or fragment != entry_key:
+            return None
+        key = fragment
+    else:
+        if entry_index is None:
+            return None
+        key = str(entry_index)
+
+    classes = _enclosing_classes(symbols, line)
+    qualified = f"{classes[0].qualname}.{name}" if classes else name
+    if not maps.name_is_fully_keyable(qualified):
+        return None
+    reads = maps.keyread_reads(qualified)
+    if not reads:
+        return None
+    if reads.get(key):
+        return None  # the changed key has readers: the mutation is reachable
+    alive: set[str] = set()
+    for other_key, ids in reads.items():
+        if other_key != key:
+            alive.update(ids)
+    if len(alive) < KEYREAD_ALIVE_TESTS:
+        return None
+    all_readers: set[str] = set()
+    for ids in reads.values():
+        all_readers.update(ids)
+    return all_readers
+
+
+def _usage_ids(
+    maps: Maps, index: TestIndex, path: str, names: Iterable[str]
+) -> dict[str, set[str]]:
+    """Test ids covering the reference lines of each name (same + cross file).
+
+    Definition lines are dropped: a module/class-level assignment executes at
+    import time, so no test's recorded coverage can reach it (it only adds
+    first-importer noise).  This keeps the rule correct whether or not the
+    committed ``usage_refs`` map already excludes them.
+    """
+    result: dict[str, set[str]] = {}
+    for name in names:
+        queries: dict[str, list[int | tuple[int, int]]] = {}
+        for reference in maps.references_of(name):
+            if name in maps.definition_names_at(reference.file, reference.line):
+                continue
+            queries.setdefault(reference.file, []).append((reference.line, reference.line))
+        ids: set[str] = set()
+        for query_file, lines in queries.items():
+            ids.update(index.ids_for_ordinals(maps.covering_tests(query_file, lines)))
+        result[name] = ids
+    return result
+
+
 def _apply_sqlglot(
     file_patch: FilePatch,
     path: str,
     maps: Maps,
     index: TestIndex,
     selection: Selection,
+    knobs: Knobs,
 ) -> bool:
     """Apply the SQLGLOT rules.  Returns False when Tier E is required."""
     symbols = maps.symbols_of(path)
     if symbols is None:
         return False
+    if path == INIT_FILE:
+        # Every test imports the package root; its exports are import-time.
+        return False
 
     file_len = maps.file_length(path)
     ranges: list[tuple[int, int]] = []
     broad_lines: set[int] = set()
+    module_lines: set[int] = set()
+    hunk_lines: list[int] = []
+    removed: list[tuple[int, str]] = []
 
     for hunk in file_patch.hunks:
         if file_len is not None:
@@ -156,7 +397,10 @@ def _apply_sqlglot(
                     return False
             elif hunk.old_start > file_len:
                 return False
-        for line in hunk.old_lines(file_len):
+        old_lines = hunk.old_lines(file_len)
+        hunk_lines.extend(old_lines)
+        removed.extend(_removed_texts(hunk))
+        for line in old_lines:
             symbol = _innermost(symbols, line)
             if symbol is not None and symbol.kind == "function":
                 whole_file = (
@@ -166,38 +410,137 @@ def _apply_sqlglot(
                 )
                 if whole_file:
                     broad_lines.add(line)
+                    module_lines.add(line)
+                elif knobs.symbol == "all":
+                    for container in symbols:
+                        if container.start <= line <= container.end:
+                            ranges.append(container.span)
                 else:
                     ranges.append(symbol.span)
             else:
                 # Module-level, class-body, or trailing text outside any symbol.
                 broad_lines.add(line)
+                if symbol is None:
+                    module_lines.add(line)
 
     if not ranges and not broad_lines:
         return True  # e.g. a pure insertion whose anchors do not exist
 
-    queries: dict[str, list[int | tuple[int, int]]] = {path: list(ranges)}
+    removed_by_line = dict(removed)
+
+    # (d) import region: top-level imports are import-time code for everyone.
+    # Only real edits count (the removed lines, plus both anchor lines of a pure
+    # insertion): a *context* line that happens to sit next to an import must
+    # not turn an ordinary function edit into Tier E.
+    import_candidates = list(removed_by_line)
+    for hunk in file_patch.hunks:
+        if hunk.old_count == 0:
+            import_candidates.extend(hunk.old_lines(file_len))
+    import_spans = maps.import_spans(path)
+    if import_spans and any(
+        start <= line <= end for line in import_candidates for start, end in import_spans
+    ):
+        return False
+
+    # (d) module-level change in a module >80% of test files import.
+    if module_lines:
+        share = maps.module_import_share(_module_of(path))
+        if share is not None and share > IMPORT_SHARE_TIER_E:
+            return False
+
+    scope_lines = list(removed_by_line) or list(hunk_lines)
+    scope = (
+        _dialect_scope(maps, path, symbols, scope_lines)
+        if knobs.dialect == "on" and maps.has_dialects()
+        else None
+    )
+    allowed: frozenset[str] | None = None
+    if scope is not None:
+        allowed = maps.tests_exposed_to_family(scope)
+        if allowed is None:
+            scope = None
+
+    parts: list[tuple[str, str, set[str]]] = []
+
+    if ranges:
+        ids = index.ids_for_ordinals(maps.covering_tests(path, ranges))
+        parts.append(("coverage", f"{len(ranges)} ranges", ids))
+
+    if broad_lines and knobs.classbody == "all":
+        # v1 behaviour: every symbol of the file (kept only as an A/B variant).
+        ids = index.ids_for_ordinals(
+            maps.covering_tests(path, [symbol.span for symbol in symbols])
+        )
+        parts.append(("classbody_all", f"{len(symbols)} symbols", ids))
 
     if broad_lines:
-        queries[path].extend(symbol.span for symbol in symbols)
-        # Safety union: tests whose recorded coverage includes the changed
-        # module/class lines themselves (usually import-time, often empty).
-        queries[path].extend((line, line) for line in broad_lines)
-        names = maps.assignments_on_lines(path, broad_lines)
-        for name in names:
-            for reference in maps.references_of(name):
-                queries.setdefault(reference.file, []).append((reference.line, reference.line))
-        selection.rules.append(
-            RuleHit("usage", path, ",".join(names) if names else "no assigned names")
+        # Safety union: tests whose coverage includes the changed lines.
+        ids = index.ids_for_ordinals(
+            maps.covering_tests(path, [(line, line) for line in broad_lines])
         )
+        parts.append(("anchor", f"{len(broad_lines)} lines", ids))
 
-    for query_file, file_queries in queries.items():
-        ordinals = maps.covering_tests(query_file, file_queries)
-        selection.add(
-            index.ids_for_ordinals(ordinals),
-            "coverage",
-            query_file,
-            f"{len(file_queries)} ranges -> {len(ordinals)} tests",
-        )
+    if broad_lines and knobs.classbody != "off":
+        assigned: dict[str, set[int]] = {}
+        for line in sorted(broad_lines):
+            for name in maps.assignments_on_lines(path, {line}):
+                assigned.setdefault(name, set()).add(line)
+
+        usage = _usage_ids(maps, index, path, assigned)
+        collapses: dict[str, set[str]] = {}
+        for name in sorted(assigned):
+            chosen: set[str] | None = None
+            for line in sorted(assigned[name]):
+                text = removed_by_line.get(line)
+                if text is None:
+                    continue
+                candidate = _keyread_collapse(
+                    maps, path, symbols, name, line, text, knobs
+                )
+                if candidate is None:
+                    continue
+                if chosen is None:
+                    chosen = candidate
+                elif chosen != candidate:
+                    chosen = None  # conflicting collapses: keep L1
+                    break
+            if chosen is not None:
+                collapses[name] = chosen
+
+        if collapses:
+            for name, ids in collapses.items():
+                parts.append(("keyread", f"{name}: {len(ids)} readers", ids))
+            remaining = [name for name in sorted(assigned) if name not in collapses]
+            if remaining:
+                parts.append(
+                    (
+                        "usage",
+                        ",".join(remaining),
+                        set().union(*(usage[name] for name in remaining)),
+                    )
+                )
+        else:
+            parts.append(
+                (
+                    "usage",
+                    ",".join(sorted(assigned)) if assigned else "no assigned names",
+                    set().union(*usage.values()) if usage else set(),
+                )
+            )
+
+    if scope is not None and allowed is not None:
+        before = set().union(*(ids for _, _, ids in parts)) if parts else set()
+        parts = [(rule, detail, ids & allowed) for rule, detail, ids in parts]
+        dropped = len(before) - len({test for _, _, ids in parts for test in ids})
+        if dropped:
+            family = maps.dialect_family(scope)
+            label = scope if len(family) == 1 else f"{scope}+{len(family) - 1} derived"
+            selection.rules.append(
+                RuleHit("dialect", path, f"{label}: -{dropped} tests")
+            )
+
+    for rule, detail, ids in parts:
+        selection.add(ids, rule, path, detail)
     return True
 
 
@@ -233,10 +576,16 @@ def _apply_fixture(
     return True
 
 
-def select_commit(files: Sequence[FilePatch], maps: Maps, index: TestIndex) -> Selection:
+def select_commit(
+    files: Sequence[FilePatch],
+    maps: Maps,
+    index: TestIndex,
+    knobs: Knobs | None = None,
+) -> Selection:
     """Select tests for one parsed commit."""
     if not files:
         return Selection(set(), [RuleHit("empty")], "empty")
+    knobs = (knobs or DEFAULT_KNOBS).normalized()
 
     # Shapes that neutrality cannot reason about are Tier E regardless of how
     # comment-like their (absent) hunks look.
@@ -261,6 +610,12 @@ def select_commit(files: Sequence[FilePatch], maps: Maps, index: TestIndex) -> S
         path = file_patch.path
         assert path is not None  # checked above
         if file_patch.is_new:
+            if path.endswith(".py") and (
+                _basename(path) in SHARED_BASENAMES
+                or path in maps.shared_files()
+                or path.endswith("/conftest.py")
+            ):
+                return _tier_e(index, f"new shared test support file {path}")
             selection.rules.append(RuleHit("new_file", path))
             continue
         if harmless:
@@ -269,7 +624,7 @@ def select_commit(files: Sequence[FilePatch], maps: Maps, index: TestIndex) -> S
         if path.startswith(SQLGLOT_PREFIX) and path.endswith(".py"):
             if file_patch.is_deleted:
                 return _tier_e(index, f"deleted source file {path}")
-            if not _apply_sqlglot(file_patch, path, maps, index, selection):
+            if not _apply_sqlglot(file_patch, path, maps, index, selection, knobs):
                 return _tier_e(index, f"unmodelled source change {path}")
         elif path.startswith(TESTS_PREFIX) and path.endswith(".py"):
             if not _apply_testpy(file_patch, path, maps, index, selection):
@@ -285,5 +640,7 @@ def select_commit(files: Sequence[FilePatch], maps: Maps, index: TestIndex) -> S
 
     # "drop tests not in tests.json"
     selection.tests &= index.all_ids
+    for rule, ids in selection.by_rule.items():
+        ids &= index.all_ids
     selection.tier = "code" if selection.rules else "empty"
     return selection
