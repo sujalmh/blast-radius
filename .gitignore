@@ -1,0 +1,6 @@
+.buildathon_session
+output.jsonl
+*.pyc
+__pycache__/
+.venv/
+.DS_Store
