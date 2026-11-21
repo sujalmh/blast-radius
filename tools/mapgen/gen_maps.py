@@ -6,11 +6,13 @@ Inputs are produced by ``run_maps.sh``:
   * ``--collect``  ``pytest --collect-only -q`` output (test ids + order)
   * ``--coverage`` coverage.py sqlite data file, one context per test node id
   * ``--trace``    JSON from ``trace_conftest.py`` (test/module -> files read)
+  * ``--dynamic``  JSON from ``trace_conftest.py`` (dialect exposure + key reads)
 
 Outputs (all 0644, deterministic gzip: mtime=0, no filename in the header):
 
   tests_index.json, coverage.bin.gz, symbols.json.gz, usage.json.gz,
-  fixtures.json.gz, source.tar.gz, MANIFEST.json
+  usage_refs.json.gz, fixtures.json.gz, dialects.json.gz, keyreads.json.gz,
+  testimports.json.gz, source.tar.gz, MANIFEST.json
 
 Format details live in MAPS_SPEC.md; this script is the only writer.  It is
 stdlib-only except for ``coverage.numbits`` (installed in the mapgen image).
@@ -511,12 +513,463 @@ def write_source_tarball(path: str, checkout: str, files: list[str]) -> int:
     return os.path.getsize(path)
 
 
+# --------------------------------------------------------------------- dialects
+_DIALECT_DIRS = frozenset({"dialects", "generators", "parsers"})
+_NON_DIALECT_MODULES = frozenset({"__init__", "base", "dialect"})
+
+# A reference "reads a key" only through these shapes; anything else (iteration,
+# expansion, copy, len(), equality, truthiness, attribute access) cannot be
+# observed by a proxy and therefore makes the constant "opaque".
+_KEYABLE_CALL_ATTRS = frozenset({"get", "__contains__", "__getitem__"})
+
+
+def dialect_keys(checkout: str) -> dict[str, str]:
+    """{registered key: class name} from sqlglot/dialects/__init__.py."""
+    path = os.path.join(checkout, "sqlglot/dialects/__init__.py")
+    keys: dict[str, str] = {}
+    try:
+        tree = ast.parse(_read_text(path))
+    except Exception as error:  # noqa: BLE001
+        log(f"WARNING: cannot parse {path}: {error}")
+        return keys
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "DIALECTS" for target in node.targets
+        ):
+            try:
+                for name in ast.literal_eval(node.value):
+                    keys[str(name).lower()] = str(name)
+            except Exception as error:  # noqa: BLE001
+                log(f"WARNING: cannot read DIALECTS: {error}")
+    return keys
+
+
+def _bucket_expander(by_file: dict[str, list[str]], known: set[str]):
+    def expand(bucket: str) -> list[str]:
+        if bucket.startswith("module:"):
+            return by_file.get(bucket[len("module:") :], [])
+        return [bucket] if bucket in known else []
+
+    return expand
+
+
+def build_dialects(
+    dynamic: dict,
+    test_ids: list[str],
+    by_file: dict[str, list[str]],
+    trees: dict[str, ast.AST],
+    checkout: str,
+) -> tuple[dict, dict[str, int]]:
+    """maps/dialects.json.gz: per-test dialect exposure + static file scope."""
+    expand = _bucket_expander(by_file, set(test_ids))
+    stats = {"exposure_tests": 0, "exposure_names": 0, "default_fallbacks": 0}
+    exposure: dict[str, set[str]] = {}
+    for bucket, names in (dynamic.get("dialects") or {}).items():
+        tests = expand(bucket)
+        cleaned = sorted({name for name in names if isinstance(name, str) and name})
+        if not tests or not cleaned:
+            continue
+        for test_id in tests:
+            exposure.setdefault(test_id, set()).update(cleaned)
+
+    # A test that never resolved a dialect ran under the base/default dialect
+    # implicitly (e.g. tests/test_jsonpath.py); record it explicitly so the
+    # selector's dialect narrowing never drops it by accident.
+    for test_id in test_ids:
+        bucket = exposure.setdefault(test_id, set())
+        if not bucket:
+            bucket.add("default")
+            stats["default_fallbacks"] += 1
+
+    keys = dialect_keys(checkout)
+    file_scope: dict[str, str] = {}
+    class_scope: dict[str, dict[str, str]] = {}
+    for rel, tree in trees.items():
+        parts = rel.split("/")
+        if len(parts) != 3 or parts[0] != "sqlglot" or parts[1] not in _DIALECT_DIRS:
+            continue
+        if not parts[2].endswith(".py"):
+            continue
+        stem = parts[2][: -len(".py")]
+        if stem in _NON_DIALECT_MODULES or stem not in keys:
+            continue
+        file_scope[rel] = stem
+        if parts[1] == "dialects":
+            classes = {
+                node.name: stem
+                for node in tree.body
+                if isinstance(node, ast.ClassDef) and node.name.lower() in keys
+            }
+            if classes:
+                class_scope[rel] = classes
+
+    stats["exposure_tests"] = len(exposure)
+    stats["exposure_names"] = sum(len(names) for names in exposure.values())
+    payload = {
+        "exposure": {test_id: sorted(names) for test_id, names in sorted(exposure.items())},
+        "file_scope": dict(sorted(file_scope.items())),
+        # Additive extension (MAPS_SPEC only asks for file_scope): class -> key
+        # for dialect classes, so a symbol-level selector can scope
+        # `class Snowflake(Dialect)` even when the file also holds helpers.
+        "class_scope": dict(sorted(class_scope.items())),
+    }
+    return payload, stats
+
+
+# --------------------------------------------------------------------- keyreads
+def _parent_maps(tree: ast.AST) -> tuple[dict, dict]:
+    parents: dict = {}
+    fields: dict = {}
+    for node in ast.walk(tree):
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        parents[item] = node
+                        fields[item] = field
+            elif isinstance(value, ast.AST):
+                parents[value] = node
+                fields[value] = field
+    return parents, fields
+
+
+def _ref_reason(ref, parents: dict, fields: dict) -> str | None:
+    """None when the reference only reads a key/index; else an opaque reason."""
+    parent = parents.get(ref)
+    if parent is None:
+        return "detached"
+    field = fields.get(ref)
+    if isinstance(parent, ast.Subscript):
+        if field == "value":
+            return None if isinstance(parent.ctx, ast.Load) else "subscript-store"
+        return "subscript-index"
+    if isinstance(parent, ast.Attribute) and field == "value":
+        if parent.attr in _KEYABLE_CALL_ATTRS:
+            grand = parents.get(parent)
+            if isinstance(grand, ast.Call) and fields.get(parent) == "func":
+                return None
+        return "attribute:" + parent.attr
+    if isinstance(parent, ast.Call) and field == "func":
+        return "call:" + type(parent.func).__name__
+    if isinstance(parent, ast.Compare) and field == "comparators":
+        return None
+    return f"{type(parent).__name__}.{field}"
+
+
+def _put(store: dict, key, reason: str | None) -> None:
+    """Keep the first opaque reason; "" marks "referenced and keyable only"."""
+    text = "" if reason is None else reason
+    if key not in store:
+        store[key] = text
+    elif store[key] == "" and text:
+        store[key] = text
+
+
+def _name_bindings(tree: ast.AST) -> set:
+    """Name/Attribute nodes that *bind* a name rather than use one.
+
+    ``KEYWORDS = {...}`` in a subclass rebinds the name; that is not a read of
+    the inherited constant and must not make the table look "opaque".  A
+    ``Subscript`` target (``X[k] = v``) is a read, so target walks stop there.
+    """
+    bindings: set = set()
+
+    def mark(node) -> None:
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            bindings.add(node)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for element in node.elts:
+                mark(element)
+        elif isinstance(node, ast.Starred):
+            mark(node.value)
+
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets = [node.target]
+        elif isinstance(node, ast.comprehension):
+            targets = [node.target]
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            targets = [node.optional_vars]
+        for target in targets:
+            mark(target)
+    return bindings
+
+
+def _collect_refs(tree: ast.AST, name_store: dict, attr_store: dict, class_store: dict) -> None:
+    parents, fields = _parent_maps(tree)
+    bindings = _name_bindings(tree)
+    stack: list[str] = []
+
+    def visit(node) -> None:
+        if isinstance(node, ast.ClassDef):
+            for child in list(node.decorator_list) + list(node.bases):
+                visit(child)
+            stack.append(node.name)
+            for child in node.body:
+                visit(child)
+            stack.pop()
+            return
+        if isinstance(node, ast.Name):
+            if node not in bindings:
+                reason = _ref_reason(node, parents, fields)
+                _put(name_store, node.id, reason)
+                if stack:
+                    _put(class_store, (".".join(stack), node.id), reason)
+        elif isinstance(node, ast.Attribute):
+            if node not in bindings:
+                _put(attr_store, node.attr, _ref_reason(node, parents, fields))
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+
+
+def _is_container_expr(node) -> bool:
+    if isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set)):
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id in {"dict", "list", "tuple", "set", "frozenset"}
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return True
+    return False
+
+
+def _container_definitions(trees: dict[str, ast.AST]):
+    """Yield (file, full name, bare name, class qualname or None)."""
+    out: list[tuple[str, str, str, str | None]] = []
+
+    def scan(rel: str, body, prefix: str | None) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(node, ast.ClassDef):
+                scan(rel, node.body, f"{prefix}.{node.name}" if prefix else node.name)
+                continue
+            value = None
+            targets = []
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                value = node.value
+                targets = [node.target]
+            if value is not None and _is_container_expr(value):
+                names: set[str] = set()
+                for target in targets:
+                    _target_names(target, names)
+                for name in sorted(names):
+                    if name in _SKIP_ASSIGN_NAMES:
+                        continue
+                    full = f"{prefix}.{name}" if prefix else name
+                    out.append((rel, full, name, prefix))
+                continue
+            for _field, child in ast.iter_fields(node):
+                if isinstance(child, list):
+                    statements = [item for item in child if isinstance(item, ast.stmt)]
+                    if statements:
+                        scan(rel, statements, prefix)
+
+    for rel, tree in trees.items():
+        scan(rel, getattr(tree, "body", []), None)
+    return out
+
+
+def build_usage_kind(trees: dict[str, ast.AST]) -> tuple[dict, dict[str, int]]:
+    """maps/keyreads.json.gz usage_kind: NAME is ``keyable`` or ``opaque``."""
+    name_refs: dict[str, str] = {}
+    attr_refs: dict[str, str] = {}
+    class_refs: dict[tuple[str, str], str] = {}
+    for tree in trees.values():
+        _collect_refs(tree, name_refs, attr_refs, class_refs)
+
+    table: dict[str, dict[str, str]] = {}
+    stats = {"keyable": 0, "opaque": 0, "reasons": {}}
+    reasons: dict[str, int] = {}
+    for rel, full, bare, qualname in _container_definitions(trees):
+        candidates = [attr_refs.get(bare)]
+        candidates.append(
+            name_refs.get(bare) if qualname is None else class_refs.get((qualname, bare))
+        )
+        used = any(reason is not None for reason in candidates)
+        opaque = next((reason for reason in candidates if reason), None)
+        if used and opaque is None:
+            kind = "keyable"
+        else:
+            kind = "opaque"
+            reason = opaque or "no-references"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        table.setdefault(rel, {})[full] = kind
+        stats[kind] += 1
+    stats["reasons"] = dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0])))
+    return {rel: dict(sorted(names.items())) for rel, names in sorted(table.items())}, stats
+
+
+def build_keyreads(
+    dynamic: dict,
+    test_ids: list[str],
+    usage_kind: dict[str, dict[str, str]],
+    name_origin: dict[str, str],
+    module_paths: dict[str, str],
+) -> tuple[dict, dict[str, int]]:
+    """maps/keyreads.json.gz: (test, NAME, key) pairs + the safety table."""
+    known = set(test_ids)
+    stats = {"tests": 0, "pairs": 0, "names": 0, "unclassified": 0, "unplaced": 0}
+    exposure: dict[str, list[list[str]]] = {}
+    for bucket, by_name in (dynamic.get("keys") or {}).items():
+        if bucket not in known:
+            continue  # module-scope / unknown reads: not attributable to a test
+        pairs: set[tuple[str, str]] = set()
+        for name, keys in by_name.items():
+            if not isinstance(name, str) or not name:
+                continue
+            for key in keys:
+                pairs.add((name, str(key)))
+        if pairs:
+            exposure[bucket] = [list(pair) for pair in sorted(pairs)]
+            stats["names"] += len({name for name, _ in pairs})
+    stats["tests"] = len(exposure)
+    stats["pairs"] = sum(len(pairs) for pairs in exposure.values())
+
+    # Every name the plugin actually proxied must have a classification.  Names
+    # created at runtime in ways the static assignment scan misses fall back to
+    # an opaque classification (conservative).
+    for name, origin in name_origin.items():
+        module = origin.split(":", 1)[0] if ":" in origin else ""
+        rel = module_paths.get(module)
+        if not rel:
+            stats["unplaced"] += 1
+            continue
+        entry = usage_kind.setdefault(rel, {})
+        if name not in entry:
+            entry[name] = "opaque"
+            usage_kind[rel] = dict(sorted(entry.items()))
+            stats["unclassified"] += 1
+    return {"exposure": dict(sorted(exposure.items())), "usage_kind": usage_kind}, stats
+
+
+# ------------------------------------------------------------------- testimports
+def _module_table(sqlglot_files: list[str]) -> dict[str, str]:
+    table: dict[str, str] = {}
+    for rel in sqlglot_files:
+        if not rel.endswith(".py"):
+            continue
+        if rel.endswith("/__init__.py"):
+            dotted = rel[: -len("/__init__.py")].replace("/", ".")
+        elif rel == "sqlglot/__init__.py":
+            dotted = "sqlglot"
+        else:
+            dotted = rel[:-3].replace("/", ".")
+        table[dotted] = rel
+    return table
+
+
+def _module_level_imports(body):
+    """Imports at module scope (descending control flow, not functions/classes)."""
+    for node in body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        else:
+            for _field, child in ast.iter_fields(node):
+                if isinstance(child, list):
+                    statements = [item for item in child if isinstance(item, ast.stmt)]
+                    if statements:
+                        yield from _module_level_imports(statements)
+
+
+def _absolute_base(current: str, is_package: bool, node: ast.ImportFrom) -> str | None:
+    if not node.level:
+        return node.module
+    parts = current.split(".")
+    if not is_package:
+        parts = parts[:-1]
+    if node.level > 1:
+        parts = parts[: -(node.level - 1)] if node.level - 1 < len(parts) else []
+    base = ".".join(part for part in parts if part)
+    if node.module:
+        base = f"{base}.{node.module}" if base else node.module
+    return base
+
+
+def _resolve_imports(
+    tree: ast.AST, current: str, is_package: bool, table: dict[str, str]
+) -> set[str]:
+    found: set[str] = set()
+    for node in _module_level_imports(getattr(tree, "body", [])):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in table:
+                    found.add(alias.name)
+            continue
+        base = _absolute_base(current, is_package, node)
+        if base and base in table:
+            found.add(base)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            candidate = f"{base}.{alias.name}" if base else alias.name
+            if candidate in table:
+                found.add(candidate)
+    return found
+
+
+def build_testimports(
+    checkout: str,
+    test_files: list[str],
+    trees: dict[str, ast.AST],
+    sqlglot_files: list[str],
+) -> tuple[dict, dict[str, int]]:
+    """maps/testimports.json.gz: test file -> transitive sqlglot modules."""
+    table = _module_table(sqlglot_files)
+    stats = {"test_files": 0, "modules": 0, "parse_errors": 0}
+
+    def closure(tree: ast.AST, current: str, is_package: bool) -> set[str]:
+        reached: set[str] = set()
+        pending = list(_resolve_imports(tree, current, is_package, table))
+        while pending:
+            module = pending.pop()
+            if module in reached:
+                continue
+            reached.add(module)
+            rel = table.get(module)
+            if rel is None:
+                continue
+            dep_tree = trees.get(rel)
+            if dep_tree is None:
+                continue
+            pending.extend(_resolve_imports(dep_tree, module, rel.endswith("__init__.py"), table))
+        return reached
+
+    payload: dict[str, list[str]] = {}
+    for test_file in sorted(test_files):
+        try:
+            tree = ast.parse(_read_text(os.path.join(checkout, test_file)))
+        except Exception as error:  # noqa: BLE001
+            log(f"WARNING: cannot parse {test_file}: {error}")
+            stats["parse_errors"] += 1
+            continue
+        modules = sorted(closure(tree, test_file[:-3].replace("/", "."), False))
+        payload[test_file] = modules
+        stats["test_files"] += 1
+        stats["modules"] += len(modules)
+    return payload, stats
+
+
 # ------------------------------------------------------------------------ main
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkout", default="/work/sqlglot")
     parser.add_argument("--coverage", default=None, help="coverage.py data file")
     parser.add_argument("--trace", default="/work/trace_reads.json")
+    parser.add_argument("--dynamic", default="/work/dynamic.json")
     parser.add_argument("--collect", default="/work/collect.txt")
     parser.add_argument("--tests-json", default=None, help="optional tests.json to pin the id set")
     parser.add_argument("--out", required=True, help="output directory (maps/)")
@@ -594,6 +1047,54 @@ def main(argv: list[str] | None = None) -> int:
 
     source_size = write_source_tarball(os.path.join(out, "source.tar.gz"), checkout, sqlglot_files)
 
+    dynamic: dict = {}
+    if os.path.isfile(args.dynamic):
+        dynamic = json.loads(_read_text(args.dynamic))
+    else:
+        log(f"WARNING: dynamic file {args.dynamic} is missing; new maps will be empty")
+    test_files = sorted(fixtures.get("__test_files__", {}))
+
+    dialects, dia_stats = build_dialects(
+        dynamic, test_ids, fixtures.get("__test_files__", {}), trees, checkout
+    )
+    dialects_size = _write_gz(os.path.join(out, "dialects.json.gz"), _json_bytes(dialects))
+    log(
+        "dialects: tests={} exposures={} default_fallbacks={} file_scope={} class_scope={}".format(
+            dia_stats["exposure_tests"],
+            dia_stats["exposure_names"],
+            dia_stats["default_fallbacks"],
+            len(dialects["file_scope"]),
+            len(dialects["class_scope"]),
+        )
+    )
+
+    usage_kind, kind_stats = build_usage_kind(trees)
+    module_paths = _module_table(sqlglot_files)
+    keyreads, kr_stats = build_keyreads(
+        dynamic, test_ids, usage_kind, dynamic.get("names") or {}, module_paths
+    )
+    keyreads_size = _write_gz(os.path.join(out, "keyreads.json.gz"), _json_bytes(keyreads))
+    log(
+        "keyreads: tests={} pairs={} names={} keyable={} opaque={} "
+        "unclassified={} unplaced={}".format(
+            kr_stats["tests"],
+            kr_stats["pairs"],
+            kr_stats["names"],
+            kind_stats["keyable"],
+            kind_stats["opaque"],
+            kr_stats["unclassified"],
+            kr_stats["unplaced"],
+        )
+    )
+
+    testimports, ti_stats = build_testimports(checkout, test_files, trees, sqlglot_files)
+    imports_size = _write_gz(os.path.join(out, "testimports.json.gz"), _json_bytes(testimports))
+    log(
+        "testimports: files={} modules={} parse_errors={}".format(
+            ti_stats["test_files"], ti_stats["modules"], ti_stats["parse_errors"]
+        )
+    )
+
     file_sha1 = {
         rel: hashlib.sha1(sources[rel].encode("utf-8")).hexdigest() for rel in sqlglot_files
     }
@@ -612,6 +1113,17 @@ def main(argv: list[str] | None = None) -> int:
             "sqlglot_files": len(sqlglot_files),
             "coverage_file_pairs": sum(len(tests) for tests in per_file.values()),
             "fixtures": fx_stats["fixture_files"],
+            "keyread_pairs": kr_stats["pairs"],
+        },
+        "keyreads": {
+            "proxied_names": len(dynamic.get("names") or {}),
+            "skipped": list(dynamic.get("skipped") or []),
+            "keyable": kind_stats["keyable"],
+            "opaque": kind_stats["opaque"],
+            "unclassified": kr_stats["unclassified"],
+            "unplaced": kr_stats["unplaced"],
+            "opaque_reasons": kind_stats["reasons"],
+            "dynamic_stats": dynamic.get("stats") or {},
         },
         "files_sha1": file_sha1,
     }
@@ -627,18 +1139,24 @@ def main(argv: list[str] | None = None) -> int:
             "usage.json.gz",
             "usage_refs.json.gz",
             "fixtures.json.gz",
+            "dialects.json.gz",
+            "keyreads.json.gz",
+            "testimports.json.gz",
             "source.tar.gz",
             "MANIFEST.json",
         )
     )
     log(
-        "sizes: coverage={}B symbols={}B usage={}B refs={}B fixtures={}B source={}B "
-        "manifest={}B total={}B".format(
+        "sizes: coverage={}B symbols={}B usage={}B refs={}B fixtures={}B dialects={}B "
+        "keyreads={}B testimports={}B source={}B manifest={}B total={}B".format(
             coverage_size,
             symbols_size,
             usage_size,
             refs_size,
             fixtures_size,
+            dialects_size,
+            keyreads_size,
+            imports_size,
             source_size,
             manifest_size,
             total,

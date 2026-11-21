@@ -26,6 +26,11 @@ docker run --rm --platform linux/amd64 \
   blast-mapgen
 ```
 
+That single pytest session produces **all** maps: coverage, symbols, usage,
+fixtures, source tarball **and** the three dynamic maps
+(`dialects.json.gz`, `keyreads.json.gz`, `testimports.json.gz`). There is no
+second pytest pass.
+
 `BR_GENERATOR_GIT` is recorded in `MANIFEST.json` (optional).
 
 `BR_TESTS_JSON` is optional: without it `tests_index.json` is the raw
@@ -49,6 +54,10 @@ python tools/mapgen/inspect_maps.py --maps /tmp/br-plumb \
   --test tests/dialects/test_dune.py::TestDune::test_dune
 ```
 
+`inspect_maps.py` validates the bundle (gzip/JSON readable, ids in the index,
+paths in `source.tar.gz`, `usage_kind` kinds, non-empty module lists) and exits
+non-zero on any error.
+
 `run_maps.sh [out-dir] [pytest targets…]` runs the same pipeline as the full
 run, so plumbing and production differ only in the pytest target.
 
@@ -59,8 +68,8 @@ run, so plumbing and production differ only in the pytest target.
    `requirements.lock` + `coverage==7.17.4` are pip-installed.
 2. **Collect** – `pytest --collect-only -q tests` → `/work/collect.txt`
    (test ids, deterministic file order).
-3. **Trace + coverage** – `pytest -p trace_conftest` with `SKIP_INTEGRATION=0`,
-   `PYTHONPATH=/work/sqlglot`, cwd `/work/sqlglot`:
+3. **Trace + coverage + dynamic maps** – `pytest -p trace_conftest` with
+   `SKIP_INTEGRATION=0`, `PYTHONPATH=/work/sqlglot`, cwd `/work/sqlglot`:
    * `trace_conftest.py` is copied into the checkout root at run time (never
      baked) and wraps `builtins.open`, `io.open`, `codecs.open`, `os.open`,
      `pathlib.Path.open/read_text/read_bytes`. Reads are attributed to the
@@ -71,6 +80,24 @@ run, so plumbing and production differ only in the pytest target.
      collection and calls `switch_context(nodeid)` around each test protocol,
      i.e. `--cov-context=test` semantics without a pytest-cov dependency. Data
      is saved to `/work/.coverage` with one sqlite context per test node id.
+   * **Dialect exposure**: `Dialect.get_or_raise` (the resolver behind
+     `parse_one` / `transpile` / `expr.sql(dialect=…)`), `Dialect.get` and
+     `Dialect.__init__` are wrapped; the resolved *registered* key comes from
+     the `Dialect._classes` reverse map (`TSQL` → `"tsql"`), the base class is
+     `"default"`. Fixture `# dialect: x` headers go through the same path
+     (`Validator.parse_one(read=self.dialect)`). Resolutions outside a test
+     land in the same `module:<tests/file.py>` buckets as fixture reads.
+   * **Key reads**: a `sys.meta_path` hook wraps `sqlglot.*` module loaders and,
+     right after each module executes, replaces module-level and class-body
+     `dict`/`list`/`tuple`/`set`/`frozenset` values with transparent proxy
+     subclasses that log `(test, NAME, key)` on `__getitem__` / `get` /
+     `__contains__`. Because patching happens at import time, import timing
+     (and therefore the coverage map) is unchanged. Copies/deepcopies degrade
+     to plain containers. `BR_KEYREADS=0` / `BR_DIALECTS=0` disable either
+     trace; `BR_KEYREADS_SCOPE=core` proxies only the highest-value tables
+     (kept as a speed escape hatch; not needed, see timing below).
+   * Both traces are written to `/work/dynamic.json` (`/work/trace_reads.json`
+     keeps the fixture file reads). `gen_maps.py` post-processes them.
 4. **Generate** – `gen_maps.py` parses the coverage sqlite itself
    (`file`, `context`, `line_bits` + `coverage.numbits.numbits_to_nums`), walks
    the pinned ASTs, and writes every file below. Gzip is deterministic
@@ -86,11 +113,54 @@ run, so plumbing and production differ only in the pytest target.
 | `usage.json.gz` | `{path: {NAME: [same-file reference lines]}}` |
 | `usage_refs.json.gz` | extension: `{NAME: {referencing file: [lines]}}` (see deviations) |
 | `fixtures.json.gz` | `{non-.py file: [test ids]}` + `__test_files__` + `__shared__` |
+| `dialects.json.gz` | `{"exposure": {test: [dialect keys]}, "file_scope": {path: key}, "class_scope": {path: {Class: key}}}` |
+| `keyreads.json.gz` | `{"exposure": {test: [[NAME, KEY], …]}, "usage_kind": {path: {NAME: "keyable"\|"opaque"}}}` |
+| `testimports.json.gz` | `{tests/test_x.py: [sqlglot.module, …]}`, static transitive top-level imports |
 | `source.tar.gz` | `sqlglot/**/*.py` only, repo-relative member names |
-| `MANIFEST.json` | pinned sha, generator/version metadata, per-file sha1 |
+| `MANIFEST.json` | pinned sha, generator/version metadata, per-file sha1, `keyreads` stats |
 
 `__shared__` = test-support files imported by ≥2 test files (e.g.
 `tests/helpers.py`, `tests/dialects/test_dialect.py`) plus any `conftest.py`.
+
+### dialects.json.gz
+
+`exposure[test]` is the set of dialect keys the test resolved, plus `"default"`
+for the base dialect; a test that resolved nothing at all also gets
+`["default"]` (conservative: it can then never be narrowed away by a
+dialect-scoped change). `file_scope` is static: `sqlglot/dialects/<name>.py`,
+`sqlglot/generators/<name>.py`, `sqlglot/parsers/<name>.py` → the registered
+key from `sqlglot/dialects/__init__.py:DIALECTS` (so `python.py`, `base.py`,
+`dialect.py`, `__init__.py` are absent). `class_scope` is an additive
+extension: the dialect classes defined in that file (`{"Snowflake":
+"snowflake"}`) so a symbol-level selector can scope a class even when the file
+also contains helpers.
+
+### keyreads.json.gz
+
+`exposure[test]` lists `[NAME, KEY]` pairs the test actually read. `NAME` is
+the bare module-level name, or `Class.NAME` for class bodies (`Dialect.
+Tokenizer.KEYWORDS` for nested classes); `KEY` is `str` for string keys,
+`repr`-style for anything else (`"1"` for `1`, `"slice(1, 2, None)"` for a
+slice, `"<DType.INT: …>"` for enum members). Reads with no current test
+(import time) are dropped — they are not attributable to a test.
+
+`usage_kind[path][NAME]` is the safety table. A name is `keyable` only when
+**every** reference to it anywhere in `sqlglot/` is one of `X[k]` (load),
+`X.get(k)` / `X.__contains__(k)` (called), or `k in X`; any other use
+(iteration, `{**X}`, `dict(X)`, `X.copy()`, `.items()/.keys()/.values()`,
+`len(X)`, truthiness, comparison, being passed to a call, `.pop/.setdefault`,
+assignment aliasing, deletion) makes it `opaque`. Names observed at runtime but
+not statically located (e.g. `Class.required_args`, computed by
+`__init_subclass__`) are `opaque`. Only `keyable` names may ever be narrowed on.
+
+### testimports.json.gz
+
+Static closure over **module-level** imports only: `tests/x.py` top-level
+`import`/`from` statements → sqlglot modules, then each sqlglot module's own
+module-level imports (relative imports resolved), stopping at the sqlglot
+package boundary. Imports inside function bodies (lazy/`if TYPE_CHECKING:`
+style deferred imports inside functions) are not followed.
+
 
 ## Sizes and timing (measured on this host, linux/amd64 under Rosetta)
 
@@ -98,24 +168,38 @@ Plumbing run `tests/test_parser.py` (81 tests):
 
 * coverage: 109 files, 855 (file, test) pairs, 33.6 KB gzip
 * symbols 53 KB · usage 28 KB · usage_refs 68 KB · source 705 KB
-* full test_parser map bundle: **907 KB total**
+* keyreads: 26 799 (test, NAME, KEY) pairs, ≈ 120 KB gzip
+* full test_parser map bundle: **≈ 1.0 MB total**
 
-Extrapolated full suite (1620 tests): coverage ≈ **0.7 MB gzip**, fixtures
-≈ 0.1–0.3 MB, everything else unchanged → **≈ 1.7–2.0 MB total**, well under
-the 8 MB budget.
+Mixed plumbing run
+`tests/dialects/test_dune.py tests/dialects/test_snowflake.py tests/test_jsonpath.py`
+(123 tests):
 
-Timing measured in the mapgen image (same host):
+* coverage 55 KB · symbols 53 KB · usage 28 KB · refs 68 KB · fixtures 1 KB
+* dialects 2.4 KB · keyreads 207 KB (**49 577 pairs**) · testimports 0.4 KB
+* total 1.14 MB
 
-| run | tests | wall |
-| --- | --- | --- |
-| `tests/dialects/test_dune.py`, full pipeline | 1 | ~5 s |
-| `tests/test_parser.py`, plain pytest | 81 | 21.3 s |
-| `tests/test_parser.py`, full pipeline | 81 | 95 s (pytest ≈ 91 s) |
+Extrapolated full suite (1620 tests): coverage ≈ **0.7 MB gzip**, keyreads ≈
+**2.5–3 MB**, fixtures ≈ 0.1–0.3 MB → **≈ 4–4.5 MB total**, inside the 8 MB
+budget (the repo limit is 20 MB).
 
-`tests.json` records 103.05 s for all 1620 tests and 29.14 s for
-`test_parser.py`; scaling the measured emulation factor (21.3/29.1) and
-coverage factor (91/21.3 ≈ 4.3) gives **≈ 330 s** for the full traced suite,
-plus ~2 s collection and ~2 s generation. Budget 6–10 minutes.
+Timing measured in the mapgen image (same host, 123-test mixed set, in one
+container so docker start-up does not dominate):
+
+| run | wall |
+| --- | --- |
+| plain pytest | 1.85 s |
+| pre-change trace + coverage only (`BR_KEYREADS=0 BR_DIALECTS=0`) | 3.61 s |
+| with dialect + key-read instrumentation | 4.26 s |
+
+So the new maps cost **1.18×** the existing coverage overhead on that set and
+**1.27×** on the worst file (`tests/test_parser.py`: 86.1 s → 109.7 s, i.e.
+4.1× → 5.2× plain pytest). Proxying *all* constants stays under the 1.5×
+threshold, so nothing is skipped by default (`MANIFEST.json:
+keyreads.skipped == []`); `BR_KEYREADS_SCOPE=core` remains as an escape hatch
+(proxies only Tokenizer/Parser/Generator/`*_MAPPING`/`arg_types`-style tables
+and records what it skipped). Full traced suite therefore ≈ **7–8 minutes**,
+plus ~2 s collection and ~2 s generation.
 
 ## Deviations / notes for the orchestrator
 
@@ -139,8 +223,38 @@ plus ~2 s collection and ~2 s generation. Budget 6–10 minutes.
   entry could fold this into `usage.json.gz`.
 * **No module pseudo-symbol** is emitted: the spec's symbol kinds are
   `function|class`, and the selector derives module-level lines from gaps.
-* Coverage starts *after* collection, so import-time execution is not
+* **Coverage starts *after* collection**, so import-time execution is not
   attributed to a test (that is what the usage map is for). Dialect modules
   imported lazily by the first test that uses them are attributed to it.
+* **Dialect exposure is per test, not per phase**: `exposure` is a set, so a
+  test that needs `"default"` for one assertion and `"duckdb"` for another
+  contains both; narrowing tests on either is therefore sound (union).
+  Module-scope dialect resolutions (e.g. a test module that parses at import
+  time) are expanded to all tests of that file, mirroring the fixture rules.
+* **`class_scope` is an additive key** in `dialects.json.gz` (MAPS_SPEC lists
+  only `exposure` + `file_scope`). `file_scope` alone cannot express a file
+  that defines more than one dialect class; `class_scope` can. Ignoring it is
+  safe (it only adds precision).
+* **`"default"` fallback**: a test with no recorded resolution gets
+  `["default"]`. This keeps dialect narrowing from ever dropping a test that
+  simply did not touch a dialect.
+* **keyreads NAME convention**: module level → `NAME`; class body →
+  `Class.NAME` (`Outer.Inner.NAME` for nested classes). The module is *not*
+  in the name, so two classes with the same qualname in different modules share
+  a name; `usage_kind` is still per file, and the selector must treat a name as
+  keyable only if **every** file that defines it says `keyable`.
+* **keyread keys are strings**: ints/None/enum members/slices are `repr`ed
+  (`"1"`, `"None"`, `"<TokenType.SELECT: 'SELECT'>"`, `"slice(1, 2, None)"`).
+  The same textual form is used for both sides of the L3 comparison.
+* **key reads outside a test are dropped** (a sink buckets them and they are
+  never written). Import-time reads are not attributable to a test, and
+  attributing them to whichever test module happened to be collecting would
+  only add false positives. Dialect resolutions *are* kept in module buckets
+  because the spec asks for fixture-like expansion there.
+* **Opaque-by-construction names**: proxy-created copies (`copy`/`deepcopy`
+  return plain containers) and runtime-computed class attributes such as
+  `Expr.required_args` cannot be followed statically; any such name that shows
+  up in the trace is classified `opaque` in `gen_maps.py` and counted as
+  `unclassified` in the log/MANIFEST.
 * Plumbing artifacts under `/tmp` are disposable; only `maps/` is committed.
   `maps/.gitkeep` is untouched.

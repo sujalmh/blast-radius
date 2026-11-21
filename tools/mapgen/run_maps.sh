@@ -22,6 +22,7 @@ fi
 CHECKOUT=/work/sqlglot
 COLLECT=/work/collect.txt
 TRACE=/work/trace_reads.json
+DYNAMIC=/work/dynamic.json
 COVDATA=/work/.coverage
 PYTEST_LOG=/work/pytest.log
 
@@ -34,7 +35,7 @@ export BR_CHECKOUT="$CHECKOUT"
 cp /mapgen/trace_conftest.py "$CHECKOUT/trace_conftest.py"
 
 mkdir -p "$OUT_DIR"
-rm -f "$COLLECT" "$TRACE" "$COVDATA" /work/pytest.err
+rm -f "$COLLECT" "$TRACE" "$DYNAMIC" "$COVDATA" /work/pytest.err
 
 START_TS=$(date +%s)
 echo "[run_maps] collecting: pytest ${TARGETS[*]}" >&2
@@ -44,16 +45,16 @@ COLLECTED=$(grep -c '::' "$COLLECT" || true)
 COLLECT_TS=$(date +%s)
 echo "[run_maps] collected lines: $COLLECTED in $((COLLECT_TS - START_TS))s" >&2
 
-echo "[run_maps] running traced suite (coverage per test, fixture reads)" >&2
-BR_TRACE_OUT="$TRACE" BR_COVERAGE_FILE="$COVDATA" \
+echo "[run_maps] running traced suite (coverage per test, fixture/dialect/key reads)" >&2
+BR_TRACE_OUT="$TRACE" BR_DYNAMIC_OUT="$DYNAMIC" BR_COVERAGE_FILE="$COVDATA" \
   python -m pytest -p trace_conftest -q --tb=no -p no:cacheprovider "${TARGETS[@]}" \
   > "$PYTEST_LOG" 2> /work/pytest.err || true
 RUN_TS=$(date +%s)
 tail -n 3 "$PYTEST_LOG" >&2 || true
 grep -E '^\[trace_conftest\]' /work/pytest.err >&2 || true
-grep -E '^\[trace_conftest\]' /work/pytest.err >&2 || true
 
 test -s "$TRACE" || { echo "[run_maps] ERROR: no trace file" >&2; exit 1; }
+test -s "$DYNAMIC" || { echo "[run_maps] ERROR: no dynamic file (dialects/keyreads)" >&2; exit 1; }
 test -s "$COVDATA" || { echo "[run_maps] ERROR: no coverage data" >&2; exit 1; }
 
 TESTS_JSON_ARGS=()
@@ -67,6 +68,7 @@ python /mapgen/gen_maps.py \
   --checkout "$CHECKOUT" \
   --coverage "$COVDATA" \
   --trace "$TRACE" \
+  --dynamic "$DYNAMIC" \
   --collect "$COLLECT" \
   --out "$OUT_DIR" \
   "${TESTS_JSON_ARGS[@]}"
