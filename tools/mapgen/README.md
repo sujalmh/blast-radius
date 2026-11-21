@@ -29,7 +29,8 @@ docker run --rm --platform linux/amd64 \
 That single pytest session produces **all** maps: coverage, symbols, usage,
 fixtures, source tarball **and** the three dynamic maps
 (`dialects.json.gz`, `keyreads.json.gz`, `testimports.json.gz`). There is no
-second pytest pass.
+second pytest pass. Inside `run_maps.sh` the session is: collect → traced
+pytest (parent + spawned workers) → `coverage combine` → `gen_maps.py`.
 
 `BR_GENERATOR_GIT` is recorded in `MANIFEST.json` (optional).
 
@@ -61,11 +62,26 @@ non-zero on any error.
 `run_maps.sh [out-dir] [pytest targets…]` runs the same pipeline as the full
 run, so plumbing and production differ only in the pytest target.
 
+Pool-proof plumbing run (spawned workers, ~13 s): the fixture-driven optimizer
+tests execute their cases in a `ProcessPoolExecutor`, so before v2 the map only
+had import-time `def` lines:
+
+```sh
+mkdir -p /tmp/br1c
+docker run --rm --platform linux/amd64 -v /tmp/br1c:/out blast-mapgen /out \
+  tests/test_optimizer.py::TestOptimizer::test_eliminate_joins
+python3 bench/probe.py --maps /tmp/br1c cover-lines \
+  sqlglot/optimizer/eliminate_joins.py 62 74     # -> 61-65,67,69-74
+```
+
 ## Stages
 
 1. **Build** – `fetch_pin.py` downloads `codeload.github.com/…/tar.gz/<sha>`
    (the README allows sqlglot at the pinned commit) into `/work/sqlglot`;
    `requirements.lock` + `coverage==7.17.4` are pip-installed.
+   `br_trace_boot.py` + `zz_blastradius_trace.pth` are installed into
+   site-packages (inert unless `BR_CHILD_TRACE=1`) and
+   `br_coverage.coveragerc` is copied to `/work/`.
 2. **Collect** – `pytest --collect-only -q tests` → `/work/collect.txt`
    (test ids, deterministic file order).
 3. **Trace + coverage + dynamic maps** – `pytest -p trace_conftest` with
@@ -76,10 +92,11 @@ run, so plumbing and production differ only in the pytest target.
      running test's node id; reads outside a test go to
      `module:<tests/file.py>` (all test ids of that file) or `__unknown__`
      (logged). Write modes are ignored.
-   * The same plugin starts `coverage.Coverage(source=["sqlglot"])` after
-     collection and calls `switch_context(nodeid)` around each test protocol,
-     i.e. `--cov-context=test` semantics without a pytest-cov dependency. Data
-     is saved to `/work/.coverage` with one sqlite context per test node id.
+   * The same plugin starts `coverage.Coverage(source=["sqlglot"],
+     data_suffix=True)` after collection and calls `switch_context(nodeid)`
+     around each test protocol, i.e. `--cov-context=test` semantics without a
+     pytest-cov dependency. Data is written in **parallel mode**
+     (`/work/.coverage.<pid>.<rand>`), one sqlite context per test node id.
    * **Dialect exposure**: `Dialect.get_or_raise` (the resolver behind
      `parse_one` / `transpile` / `expr.sql(dialect=…)`), `Dialect.get` and
      `Dialect.__init__` are wrapped; the resolved *registered* key comes from
@@ -98,10 +115,32 @@ run, so plumbing and production differ only in the pytest target.
      (kept as a speed escape hatch; not needed, see timing below).
    * Both traces are written to `/work/dynamic.json` (`/work/trace_reads.json`
      keeps the fixture file reads). `gen_maps.py` post-processes them.
+   * **Subprocess coverage (v2, bug 1)**: `tests/test_optimizer.py` and
+     `tests/test_executor.py` run every fixture-driven case in a
+     `ProcessPoolExecutor(mp_context=get_context("spawn"))`. The plugin
+     monkeypatches `ProcessPoolExecutor.submit` so every task becomes
+     `submit(_br_task, current_test_id, fn, …)`; `_br_task` (module-level, so
+     spawn can pickle it by qualname) sets the worker's current test, calls
+     `Coverage.current().switch_context(test_id)`, runs `fn`, and the worker
+     writes its dialect/key trace to `/work/dynamic.json.<pid>.child.json`
+     (plus a line in `/work/dynamic.json.children.log`). Workers are
+     instrumented from interpreter startup by `br_trace_boot.py`, installed
+     into site-packages with a `zz_blastradius_trace.pth`; it is a no-op unless
+     `BR_CHILD_TRACE=1` (set by `trace_conftest` in the pytest parent, inherited
+     by workers), in which case it also calls `coverage.process_startup()` using
+     `COVERAGE_PROCESS_START=/work/br_coverage.coveragerc` (`parallel = true`,
+     `source = sqlglot`, `data_file = /work/.coverage`).
+   * `run_maps.sh` then runs `coverage combine --data-file=/work/.coverage
+     /work /work/sqlglot` (**fails loudly** if there are no parallel data files
+     or no contexts) before generation, so parent + workers end up in one
+     `.coverage` with per-test contexts. `gen_maps.py` merges
+     `dynamic.json` with every `dynamic.json.*.child.json` automatically.
 4. **Generate** – `gen_maps.py` parses the coverage sqlite itself
    (`file`, `context`, `line_bits` + `coverage.numbits.numbits_to_nums`), walks
    the pinned ASTs, and writes every file below. Gzip is deterministic
-   (`mtime=0`, no embedded filename) and JSON is sorted/compact.
+   (`mtime=0`, no embedded filename) and JSON is sorted/compact; set-union
+   merging of worker traces is order-independent, so two runs are byte-identical
+   (verified by sha256 on the plumbing target).
 
 ## Outputs
 
@@ -110,8 +149,8 @@ run, so plumbing and production differ only in the pytest target.
 | `tests_index.json` | `{"test_ids": [...]}` in collection order; ordinal = position |
 | `coverage.bin.gz` | `BRcov1` binary, per-file per-ordinal 1-based inclusive runs |
 | `symbols.json.gz` | `{path: [[qualname, start, end, "function"\|"class"]]}` |
-| `usage.json.gz` | `{path: {NAME: [same-file reference lines]}}` |
-| `usage_refs.json.gz` | extension: `{NAME: {referencing file: [lines]}}` (see deviations) |
+| `usage.json.gz` | `{path: {NAME: [same-file reference lines]}}` — `Name.id` **and** `Attribute.attr` matches, definition lines excluded |
+| `usage_refs.json.gz` | `{NAME: {referencing file: [lines]}}` — same v2 reference rule, all files (see deviations) |
 | `fixtures.json.gz` | `{non-.py file: [test ids]}` + `__test_files__` + `__shared__` |
 | `dialects.json.gz` | `{"exposure": {test: [dialect keys]}, "file_scope": {path: key}, "class_scope": {path: {Class: key}}}` |
 | `keyreads.json.gz` | `{"exposure": {test: [[NAME, KEY], …]}, "usage_kind": {path: {NAME: "keyable"\|"opaque"}}}` |
@@ -183,26 +222,62 @@ Extrapolated full suite (1620 tests): coverage ≈ **0.7 MB gzip**, keyreads ≈
 **2.5–3 MB**, fixtures ≈ 0.1–0.3 MB → **≈ 4–4.5 MB total**, inside the 8 MB
 budget (the repo limit is 20 MB).
 
-Timing measured in the mapgen image (same host, 123-test mixed set, in one
-container so docker start-up does not dominate):
+Timing measured in the mapgen image (same host, linux/amd64 under Rosetta, in
+one container so docker start-up does not dominate):
 
-| run | wall |
-| --- | --- |
-| plain pytest | 1.85 s |
-| pre-change trace + coverage only (`BR_KEYREADS=0 BR_DIALECTS=0`) | 3.61 s |
-| with dialect + key-read instrumentation | 4.26 s |
+| run | plain | traced (v1: parent only) | traced (v2: + subprocess) |
+| --- | --- | --- | --- |
+| 123-test mixed set | 3.65 s | — | 4.39 s |
+| `tests/test_optimizer.py::…::test_eliminate_joins` | 3.52 s | 3.6 s | 4.08 s |
+| `tests/test_optimizer.py` (167 tests, 6 082 subtests, pool-driven) | 38.75 s | — | 44.65 s |
+| `tests/test_executor.py` (60 tests, 426 subtests, pool per test) | 34.08 s | — | 48.33 s |
 
-So the new maps cost **1.18×** the existing coverage overhead on that set and
-**1.27×** on the worst file (`tests/test_parser.py`: 86.1 s → 109.7 s, i.e.
-4.1× → 5.2× plain pytest). Proxying *all* constants stays under the 1.5×
-threshold, so nothing is skipped by default (`MANIFEST.json:
-keyreads.skipped == []`); `BR_KEYREADS_SCOPE=core` remains as an escape hatch
-(proxies only Tokenizer/Parser/Generator/`*_MAPPING`/`arg_types`-style tables
-and records what it skipped). Full traced suite therefore ≈ **7–8 minutes**,
-plus ~2 s collection and ~2 s generation.
+So subprocess tracing costs **1.15×** on the big optimizer file, **1.42×** on
+`test_executor.py` (it builds a fresh 10-worker pool per test, so every worker
+pays the pytest+coverage import), and **~1.16–1.20×** on small sets. In absolute
+terms the two pool files add ≈ **20 s** to the suite. Proxying *all* constants
+stays under the 1.5× threshold, so nothing is skipped by default
+(`MANIFEST.json: keyreads.skipped == []`); `BR_KEYREADS_SCOPE=core` remains an
+escape hatch (proxies only Tokenizer/Parser/Generator/`*_MAPPING`/`arg_types`-style
+tables and records what it skipped). Full traced suite therefore still ≈
+**8–10 minutes** (v1 measured 6–10), plus ~2 s collection, ~1–2 s combine and
+~2 s generation.
+
+Note: the parent-side coverage startup and `coverage combine` are cheap; the
+real v2 cost is the extra spawn workers' instrumentation, which only exists for
+`tests/test_optimizer.py` and `tests/test_executor.py`.
 
 ## Deviations / notes for the orchestrator
 
+* **Fixture reads stay parent-side**: `check_file`/`_mp_execute` enumerate
+  fixture pairs in the parent and only the per-case work is submitted, so
+  `fixtures.json.gz` is complete. Workers do not install the `open()` wrappers
+  (a hypothetical future test that reads fixtures inside a task would be
+  invisible to the fixture map; none does today).
+* **`bench/probe.py usage NAME` reads only `usage.json.gz`**, i.e. same-file
+  references. Cross-file proof for a name (e.g. `WEEK_OFFSET`) must be read from
+  `maps/usage_refs.json.gz` (`{"NAME": {"file": [lines]}}`); the selector's
+  `references_of()` already unions both maps, so selection is unaffected. The
+  v2 reference rule (Name **and** Attribute matches, definition lines excluded)
+  applies identically to both files.
+* **Definition lines are excluded from reference sets** (v2, bug 2): a
+  module/class-body assignment of `NAME` is not a *use* of `NAME`; keeping it
+  only added first-importer noise (`WEEK_OFFSET = 0` at `dialects/tsql.py:17`).
+  The definition lines remain in `symbols`/coverage data as usual.
+* **Coverage data is parallel-mode** (`.coverage.<pid>.<rand>`) and only exists
+  as a single file after `coverage combine`; `run_maps.sh` fails if combine sees
+  no data files or produces no contexts. Child import-time execution lands in
+  the empty context and is dropped by `gen_maps.py` (`import_time=` counter),
+  exactly like the parent's.
+* **`<dynamic>.children.log`** lists every worker that flushed a trace
+  (`<pid> tasks=<n>`); pytest's fd-capture hides worker stderr while tests run,
+  so this file is the audit trail. `gen_maps.py` merges
+  `<dynamic>.*.child.json` and records `MANIFEST.capture` (`version: 2`,
+  `dynamic_parents`, `dynamic_children`).
+* **`inspect_maps.py` also validates the v2 usage rule** for bundles whose
+  manifest says `capture.version >= 2`: it re-parses `source.tar.gz` and fails
+  if any `usage`/`usage_refs` entry contains one of the name's own definition
+  lines (`--name WEEK_OFFSET` prints that name's cross-file references).
 * **Build context is `tools/mapgen/`, not `.`** — the repo-root
   `.dockerignore` (W4, intentionally) excludes `tools/` and
   `requirements.lock`, so a root-context build cannot see them. The
@@ -212,7 +287,8 @@ plus ~2 s collection and ~2 s generation.
   `COPY` lines are then the only change needed.
 * **No pytest-cov** (not in `requirements.lock`): contexts are driven with the
   coverage API directly, which is what `--cov-context=test` does.
-  `coverage==7.17.4` is pinned as a build ARG.
+  `coverage==7.17.4` is pinned as a build ARG. The `.pth`/`br_trace_boot.py`
+  shim lives in site-packages; it is inert unless `BR_CHILD_TRACE=1`.
 * **`usage.json.gz` is the only sound reading of the v1 format**: the spec keys
   by defining file but stores bare line numbers, so cross-file references
   cannot be represented. Values are therefore references *in that file*.

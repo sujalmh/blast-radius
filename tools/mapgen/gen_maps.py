@@ -148,6 +148,99 @@ def load_test_ids(collect_path: str, tests_json: str | None) -> list[str]:
     return ids
 
 
+def _merge_dynamic(target: dict, payload: dict, include_stats: bool) -> None:
+    """Union one trace_conftest dynamic payload into the accumulator."""
+    for bucket, names in (payload.get("dialects") or {}).items():
+        target["dialects"].setdefault(bucket, set()).update(
+            name for name in names if isinstance(name, str)
+        )
+    for bucket, by_name in (payload.get("keys") or {}).items():
+        entry = target["keys"].setdefault(bucket, {})
+        for name, keys in by_name.items():
+            entry.setdefault(name, set()).update(str(key) for key in keys)
+    for name, origin in (payload.get("names") or {}).items():
+        target["names"].setdefault(name, origin)
+    target["skipped"].update(payload.get("skipped") or ())
+    if include_stats:
+        # Per-process counters are not additive (workers may split the same
+        # test's reads), so only the parent's raw counters are kept; derived
+        # numbers are recomputed from the merged data below.
+        for key, value in (payload.get("stats") or {}).items():
+            if isinstance(value, int):
+                target["stats"][key] = value
+
+
+def load_dynamic(dynamic_path: str) -> tuple[dict, dict[str, int]]:
+    """Merge the parent trace and every spawned worker's trace.
+
+    ``trace_conftest.py`` writes ``<BR_DYNAMIC_OUT>`` in the pytest parent and
+    ``<BR_DYNAMIC_OUT>.<pid>.child.json`` in each ``ProcessPoolExecutor``
+    worker (MAPS_SPEC v2, bug 1: dialect and key-read activity for fixture-driven
+    tests happens inside those workers).  The child files are discovered next to
+    the parent file so the pipeline keeps a single ``--dynamic`` argument.
+    """
+    merged: dict = {
+        "dialects": {},
+        "keys": {},
+        "names": {},
+        "skipped": set(),
+        "stats": {},
+    }
+    stats = {"parents": 0, "children": 0}
+    detail = []
+    directory, base = os.path.split(dynamic_path)
+    candidates = [dynamic_path]
+    if os.path.isdir(directory or "."):
+        prefix = base + "."
+        for name in sorted(os.listdir(directory or ".")):
+            if name.startswith(prefix) and name.endswith(".child.json"):
+                candidates.append(os.path.join(directory, name))
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            payload = json.loads(_read_text(candidate))
+        except Exception as error:  # noqa: BLE001 - one bad worker must not stop the run
+            log(f"WARNING: cannot read dynamic trace {candidate}: {error}")
+            continue
+        if candidate == dynamic_path:
+            stats["parents"] += 1
+        else:
+            stats["children"] += 1
+        _merge_dynamic(merged, payload, include_stats=candidate == dynamic_path)
+        detail.append(
+            "{}:{}k".format(
+                os.path.basename(candidate),
+                len(payload.get("keys") or {}),
+            )
+        )
+    merged["skipped"] = sorted(merged["skipped"])
+    merged["dialects"] = {
+        bucket: sorted(names) for bucket, names in merged["dialects"].items()
+    }
+    merged["keys"] = {
+        bucket: {name: sorted(keys) for name, keys in sorted(by_name.items())}
+        for bucket, by_name in merged["keys"].items()
+    }
+    merged["stats"].update(
+        {
+            "proxied_names": len(merged["names"]),
+            "key_pairs": sum(
+                len(keys) for by_name in merged["keys"].values() for keys in by_name.values()
+            ),
+            "dialect_buckets": len(merged["dialects"]),
+            "traces": stats["parents"] + stats["children"],
+            "child_traces": stats["children"],
+        }
+    )
+    if detail:
+        shown = ", ".join(detail[:5])
+        if len(detail) > 5:
+            shown += f", ... ({len(detail) - 5} more)"
+        log(f"dynamic traces: {shown}")
+    return merged, stats
+
+
 def parse_coverage_payload(payload: bytes) -> dict[str, list[tuple[int, int, int]]]:
     """Decode ``coverage.bin.gz`` into {file: [(start, end, ordinal), ...]}."""
     if len(payload) < 10 or payload[:6] != COVERAGE_MAGIC:
@@ -330,9 +423,20 @@ def _target_names(target, out: set[str]) -> None:
         _target_names(target.value, out)
 
 
-def assigned_names(tree: ast.AST) -> set[str]:
-    """Names bound by Assign/AnnAssign at module or class body level."""
-    names: set[str] = set()
+def _target_bindings(target, out: dict[str, set[int]]) -> None:
+    """Like ``_target_names``, but records the binding (definition) lines."""
+    if isinstance(target, ast.Name):
+        out.setdefault(target.id, set()).add(target.lineno)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _target_bindings(element, out)
+    elif isinstance(target, ast.Starred):
+        _target_bindings(target.value, out)
+
+
+def assigned_bindings(tree: ast.AST) -> dict[str, set[int]]:
+    """Names bound by Assign/AnnAssign at module or class body level -> lines."""
+    bindings: dict[str, set[int]] = {}
 
     def scan(body) -> None:
         for node in body:
@@ -343,10 +447,10 @@ def assigned_names(tree: ast.AST) -> set[str]:
                 continue
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    _target_names(target, names)
+                    _target_bindings(target, bindings)
                 continue
             if isinstance(node, ast.AnnAssign):
-                _target_names(node.target, names)
+                _target_bindings(node.target, bindings)
                 continue
             # module/class level control flow: if/try/with/for bodies still bind
             # at the enclosing scope.
@@ -357,7 +461,14 @@ def assigned_names(tree: ast.AST) -> set[str]:
                         scan(statements)
 
     scan(getattr(tree, "body", []))
-    return {name for name in names if name not in _SKIP_ASSIGN_NAMES}
+    return {
+        name: lines for name, lines in bindings.items() if name not in _SKIP_ASSIGN_NAMES
+    }
+
+
+def assigned_names(tree: ast.AST) -> set[str]:
+    """Names bound by Assign/AnnAssign at module or class body level."""
+    return set(assigned_bindings(tree))
 
 
 def build_usage(trees: dict[str, ast.AST]):
@@ -371,8 +482,16 @@ def build_usage(trees: dict[str, ast.AST]):
     which can only be sound for references in the same file.  ``crossfile`` is
     the unambiguous superset for selectors that want cross-module references;
     it is written to ``usage_refs.json.gz``.
+
+    References are every ``Name.id == NAME`` *and* ``Attribute.attr == NAME``
+    occurrence (v2 fix: ``dialect.WEEK_OFFSET`` / ``self.dialect.WEEK_OFFSET``
+    reads are not ``Name`` nodes and used to be invisible).  Each name's own
+    definition lines are excluded from its reference set: module/class-body
+    assignments execute at import time, so keeping them only adds first-importer
+    noise (`WEEK_OFFSET = 0` is not a *use* of WEEK_OFFSET).
     """
     references: dict[str, dict[str, set[int]]] = {}
+    definitions: dict[str, dict[str, set[int]]] = {}
     for rel, tree in trees.items():
         local: dict[str, set[int]] = {}
         for node in ast.walk(tree):
@@ -382,6 +501,14 @@ def build_usage(trees: dict[str, ast.AST]):
                 local.setdefault(node.attr, set()).add(node.lineno)
         for name, lines in local.items():
             references.setdefault(name, {})[rel] = lines
+        for name, lines in assigned_bindings(tree).items():
+            definitions.setdefault(name, {})[rel] = lines
+
+    def reference_lines(name: str, rel: str) -> set[int]:
+        lines = references.get(name, {}).get(rel)
+        if not lines:
+            return set()
+        return lines - definitions.get(name, {}).get(rel, set())
 
     usage: dict[str, dict[str, list[int]]] = {}
     defining: dict[str, set[str]] = {}
@@ -392,15 +519,19 @@ def build_usage(trees: dict[str, ast.AST]):
         entry: dict[str, list[int]] = {}
         for name in sorted(names):
             defining.setdefault(name, set()).add(rel)
-            entry[name] = sorted(references.get(name, {}).get(rel, ()))
+            entry[name] = sorted(reference_lines(name, rel))
         usage[rel] = entry
 
     crossfile: dict[str, dict[str, list[int]]] = {}
     for name in sorted(defining):
-        by_file = references.get(name, {})
+        by_file: dict[str, list[int]] = {}
+        for rel in references.get(name, {}):
+            lines = reference_lines(name, rel)
+            if lines:
+                by_file[rel] = sorted(lines)
         files = defining[name]
         if any(path not in files for path in by_file):
-            crossfile[name] = {path: sorted(lines) for path, lines in sorted(by_file.items())}
+            crossfile[name] = dict(sorted(by_file.items()))
     return usage, crossfile
 
 
@@ -1048,10 +1179,17 @@ def main(argv: list[str] | None = None) -> int:
     source_size = write_source_tarball(os.path.join(out, "source.tar.gz"), checkout, sqlglot_files)
 
     dynamic: dict = {}
+    dynamic_stats = {"parents": 0, "children": 0}
     if os.path.isfile(args.dynamic):
-        dynamic = json.loads(_read_text(args.dynamic))
+        dynamic, dynamic_stats = load_dynamic(args.dynamic)
     else:
         log(f"WARNING: dynamic file {args.dynamic} is missing; new maps will be empty")
+    if dynamic_stats["children"] or dynamic_stats["parents"] > 1:
+        log(
+            "dynamic merge: parents={} children={}".format(
+                dynamic_stats["parents"], dynamic_stats["children"]
+            )
+        )
     test_files = sorted(fixtures.get("__test_files__", {}))
 
     dialects, dia_stats = build_dialects(
@@ -1124,6 +1262,12 @@ def main(argv: list[str] | None = None) -> int:
             "unplaced": kr_stats["unplaced"],
             "opaque_reasons": kind_stats["reasons"],
             "dynamic_stats": dynamic.get("stats") or {},
+        },
+        "capture": {
+            "version": 2,
+            "subprocess_trace": True,
+            "dynamic_parents": dynamic_stats["parents"],
+            "dynamic_children": dynamic_stats["children"],
         },
         "files_sha1": file_sha1,
     }

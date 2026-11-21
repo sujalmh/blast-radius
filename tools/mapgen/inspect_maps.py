@@ -14,6 +14,7 @@ manifests consistent).  Everything is printed to stdout.
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import json
 import os
@@ -22,7 +23,7 @@ import tarfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gen_maps import _lines_to_runs, parse_coverage_payload  # noqa: E402
+from gen_maps import _lines_to_runs, assigned_bindings, parse_coverage_payload  # noqa: E402
 
 KINDS = {"keyable", "opaque"}
 
@@ -42,6 +43,7 @@ def main() -> int:
     parser.add_argument("--maps", default="maps")
     parser.add_argument("--file", default=None)
     parser.add_argument("--test", default=None)
+    parser.add_argument("--name", default=None, help="usage name to print (e.g. WEEK_OFFSET)")
     parser.add_argument("--limit", type=int, default=6)
     args = parser.parse_args()
 
@@ -71,6 +73,58 @@ def main() -> int:
         print(f"source.tar.gz: {len(members)} members (e.g. {dune})")
     except FileNotFoundError:
         errors.append("source.tar.gz: missing")
+
+    # ------------------------------------------------------ usage (v2 checks)
+    capture = manifest.get("capture") if isinstance(manifest, dict) else None
+    if isinstance(capture, dict) and int(capture.get("version") or 0) >= 2:
+        usage = read_gz_json(os.path.join(args.maps, "usage.json.gz"))
+        refs = read_gz_json(os.path.join(args.maps, "usage_refs.json.gz"))
+        definitions: dict[str, dict[str, set[int]]] = {}
+        try:
+            with tarfile.open(os.path.join(args.maps, "source.tar.gz"), "r:gz") as tar:
+                for member in tar.getmembers():
+                    if not member.isfile() or not member.name.endswith(".py"):
+                        continue
+                    extracted = tar.extractfile(member)
+                    if extracted is None:
+                        continue
+                    try:
+                        tree = ast.parse(extracted.read().decode("utf-8", "replace"))
+                    except SyntaxError:
+                        continue
+                    for name, lines in assigned_bindings(tree).items():
+                        definitions.setdefault(name, {}).setdefault(member.name, set()).update(
+                            lines
+                        )
+        except FileNotFoundError:
+            definitions = {}
+
+        def definition_noise(name: str, rel: str, lines) -> list[int]:
+            own = definitions.get(name, {}).get(rel, set())
+            return [int(line) for line in lines if int(line) in own]
+
+        noise: list[str] = []
+        for name, by_file in refs.items():
+            for rel, lines in by_file.items():
+                hit = definition_noise(name, rel, lines)
+                if hit:
+                    noise.append(f"usage_refs {name}@{rel}:{hit[:3]}")
+        same_file_noise = 0
+        for rel, names in usage.items():
+            for name, lines in names.items():
+                hit = definition_noise(name, rel, lines)
+                if hit:
+                    same_file_noise += 1
+                    if len(noise) < 5:
+                        noise.append(f"usage {name}@{rel}:{hit[:3]}")
+        print(
+            f"\nusage(v2): ref_names={len(refs)} same_file_names={sum(len(v) for v in usage.values())} "
+            f"definition_lines_in_refs={len(noise)} same_file_def_noise={same_file_noise}"
+        )
+        if args.name and args.name in refs:
+            print(f"  {args.name} refs: {refs[args.name]}")
+        if noise:
+            errors.append("usage maps still reference definition lines: " + "; ".join(noise[:3]))
 
     # ---------------------------------------------------------------- new maps
     dialects = keyreads = testimports = None

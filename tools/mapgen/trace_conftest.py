@@ -48,6 +48,23 @@ session:
    ``gen_maps.py`` normalises the same way and only ever compares the emitted
    form.
 
+5. Subprocess tracing (MAPS_SPEC "Mapgen v2", bug 1).  ``tests/test_optimizer.py``
+   and ``tests/test_executor.py`` run every fixture-driven case in a
+   ``ProcessPoolExecutor(mp_context=get_context("spawn"))``, so the parent's
+   per-test coverage/dialect/key traces never see the real work.  Fix:
+   ``ProcessPoolExecutor.submit`` is monkeypatched (parent side) so every task
+   becomes ``submit(_br_task, current_test_id, fn, *args, **kwargs)``;
+   ``_br_task`` runs in the worker, sets the current test, calls
+   ``Coverage.current().switch_context(test_id)``, runs ``fn`` and restores
+   state.  Workers get coverage from ``COVERAGE_PROCESS_START`` (started by the
+   sitecustomize shim ``br_trace_boot.py`` installed in site-packages, which
+   also imports *this* module at interpreter startup so the proxies and the
+   dialect hooks exist in every child), and write their dynamic trace to
+   ``<BR_DYNAMIC_OUT>.<pid>.child.json``.  ``run_maps.sh`` runs
+   ``coverage combine`` and ``gen_maps.py`` merges the child JSON files.  Both
+   the parent and the children save data in parallel mode so combine can merge
+   them into one ``.coverage``.
+
 Safety: nothing here may change test behaviour, so the proxies are exact
 subclasses, copies/deepcopies degrade to plain containers (a copy is a
 protocol-level read a proxy cannot observe, so those names are classified
@@ -62,6 +79,13 @@ Environment:
   BR_KEYREADS=0     disable the constant-key proxies
   BR_DIALECTS=0     disable the dialect-exposure trace
   BR_KEYREADS_SCOPE all|core  which constants to proxy (default: all)
+  BR_SUBPROCESS_TRACE=0  disable the ProcessPoolExecutor submit wrapper
+  BR_CHILD_TRACE   set to 1 by this module for spawned children; the
+                   sitecustomize shim (br_trace_boot.py) only instruments a
+                   process when it is set, so the pytest parent never starts
+                   coverage twice.  Never set it by hand.
+  COVERAGE_PROCESS_START  .coveragerc consumed by coverage.process_startup()
+                   in children (set by run_maps.sh).
 
 Logs go to stderr.  Never reads ``.buildathon_session`` or anything outside
 the checkout.
@@ -69,6 +93,7 @@ the checkout.
 
 from __future__ import annotations
 
+import atexit
 import builtins
 import codecs
 from collections import defaultdict
@@ -90,6 +115,11 @@ COVERAGE_ENABLED = os.environ.get("BR_COVERAGE", "1") != "0"
 KEYREADS_ENABLED = os.environ.get("BR_KEYREADS", "1") != "0"
 DIALECTS_ENABLED = os.environ.get("BR_DIALECTS", "1") != "0"
 KEYREADS_SCOPE = os.environ.get("BR_KEYREADS_SCOPE", "all")
+SUBPROCESS_TRACE = os.environ.get("BR_SUBPROCESS_TRACE", "1") != "0"
+# True only inside a spawned worker (the sitecustomize shim imports this module
+# there).  The parent sets the env var for its future children at import time.
+CHILD_MODE = os.environ.get("BR_CHILD_TRACE") == "1"
+CHILD_DYNAMIC_OUT = f"{DYNAMIC_OUT}.{os.getpid()}.child.json"
 _SELF = os.path.realpath(__file__)
 
 # Relative paths that are bookkeeping, never fixtures.
@@ -682,6 +712,120 @@ def _dia_record(klass) -> None:
         return
 
 
+# --------------------------------------------------- subprocess (spawn) tracing
+# Spawned pool workers are fresh interpreters: the proxies/dialect hooks only
+# exist there because ``br_trace_boot`` (loaded from a .pth in site-packages)
+# imports this module at startup, and coverage only exists because
+# ``coverage.process_startup()`` reads COVERAGE_PROCESS_START.  The parent
+# registers the *picklable* ``_br_task`` wrapper so every pool task carries its
+# test id across the process boundary.
+_CHILD_TASKS = 0
+_CHILD_FLUSH_EVERY = 100
+
+
+def _child_coverage():
+    """The coverage instance started by ``coverage.process_startup()``."""
+    try:
+        import coverage  # type: ignore
+
+        return coverage.Coverage.current()
+    except Exception:  # noqa: BLE001 - no coverage in this process
+        return None
+
+
+def _br_task(test_id, fn, *args, **kwargs):
+    """Worker-side wrapper: attribute the task to *test_id*.
+
+    Set before ``fn`` runs so the dialect hooks and the container proxies that
+    execute inside the worker land in the right test bucket, then switch the
+    coverage context (parallel-mode data is saved at process exit).
+    """
+    global _current_test, _CUR_KEYS, _CUR_DIA, _CHILD_TASKS
+    previous = (_current_test, _CUR_KEYS, _CUR_DIA)
+    if test_id:
+        _current_test = test_id
+        if KEYREADS_ENABLED:
+            _CUR_KEYS = _keyreads.setdefault(test_id, defaultdict(set))
+        if DIALECTS_ENABLED:
+            _CUR_DIA = _dialects.setdefault(test_id, set())
+    coverage_instance = _child_coverage()
+    if coverage_instance is not None and test_id:
+        try:
+            coverage_instance.switch_context(test_id)
+        except Exception:  # noqa: BLE001 - tracing must not break the task
+            pass
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if coverage_instance is not None:
+            try:
+                coverage_instance.switch_context("")
+            except Exception:  # noqa: BLE001
+                pass
+        _current_test, _CUR_KEYS, _CUR_DIA = previous
+        _CHILD_TASKS += 1
+        if _CHILD_TASKS % _CHILD_FLUSH_EVERY == 0:
+            _child_flush()
+
+
+def _install_pool_wrapper() -> None:
+    """Route every ProcessPoolExecutor task through ``_br_task``."""
+    if not SUBPROCESS_TRACE:
+        return
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+
+        original_submit = ProcessPoolExecutor.submit
+        if getattr(original_submit, "_br_wrapped", False):
+            return
+
+        @functools.wraps(original_submit)
+        def traced_submit(self, fn, /, *args, **kwargs):
+            return original_submit(
+                self, _br_task, _current_test or "", fn, *args, **kwargs
+            )
+
+        traced_submit._br_wrapped = True  # type: ignore[attr-defined]
+        ProcessPoolExecutor.submit = traced_submit  # type: ignore[method-assign]
+        print(
+            "[trace_conftest] ProcessPoolExecutor.submit wrapped (subprocess tracing)",
+            file=sys.stderr,
+        )
+    except Exception as error:  # noqa: BLE001 - tracing must never break the suite
+        print(f"[trace_conftest] pool wrapper failed: {error}", file=sys.stderr)
+
+
+def _child_flush() -> None:
+    """Write this worker's dynamic trace (dialects/keys)."""
+    global _CHILD_TASKS
+    coverage_instance = _child_coverage()
+    if coverage_instance is not None:
+        try:
+            coverage_instance.save()
+        except Exception as error:  # noqa: BLE001
+            print(f"[trace_conftest] child coverage save failed: {error}", file=sys.stderr)
+    try:
+        _write_json(CHILD_DYNAMIC_OUT, _dynamic_payload())
+    except Exception as error:  # noqa: BLE001
+        print(f"[trace_conftest] child dynamic write failed: {error}", file=sys.stderr)
+    # pytest's fd-capture swallows worker stderr while tests run, so leave an
+    # audit trail next to the trace files instead.
+    try:
+        with open(DYNAMIC_OUT + ".children.log", "a", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()} tasks={_CHILD_TASKS}\n")
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+    print(
+        f"[trace_conftest] child flush pid={os.getpid()} tasks={_CHILD_TASKS} "
+        f"file={CHILD_DYNAMIC_OUT}",
+        file=sys.stderr,
+    )
+
+
+def _child_exit() -> None:
+    _child_flush()
+
+
 # ---------------------------------------------------------------------- pytest
 def pytest_configure(config):
     global _coverage
@@ -699,6 +843,10 @@ def pytest_configure(config):
             source=["sqlglot"],
             branch=False,
             config_file=False,
+            # Parallel mode: the parent writes .coverage.<pid>.<rand> too, so
+            # ``coverage combine`` merges the parent and every worker's data
+            # into one file (MAPS_SPEC v2, subprocess coverage).
+            data_suffix=True,
         )
         config.pluginmanager.register(_CoverageStarter(cov), "blastradius-coverage")
         _coverage = cov
@@ -804,6 +952,39 @@ def _write_json(path: str, payload) -> None:
     os.replace(tmp, path)
 
 
+def _dynamic_payload() -> dict:
+    """Dialect/key-read payload; also written by every spawned worker."""
+    keys_payload: dict[str, dict[str, list[str]]] = {}
+    pair_count = 0
+    for bucket, by_name in _keyreads.items():
+        entry: dict[str, list[str]] = {}
+        for name, keys in by_name.items():
+            if not name:
+                continue  # reconstructed copies lose the name; drop them
+            text = sorted({_key_text(key) for key in keys})
+            entry[name] = text
+            pair_count += len(text)
+        if entry:
+            keys_payload[bucket] = entry
+    dialects_payload = {
+        bucket: sorted(names) for bucket, names in _dialects.items() if names
+    }
+    return {
+        "dialects": dialects_payload,
+        "keys": keys_payload,
+        "names": _names,
+        "skipped": sorted(_skipped),
+        "stats": {
+            "patched_modules": len(_patched_modules),
+            "proxied_names": len(_names),
+            "key_pairs": pair_count,
+            "sink_pairs": sum(len(keys) for keys in _SINK.values()),
+            "dialect_buckets": len(dialects_payload),
+        },
+        "child": CHILD_MODE,
+    }
+
+
 def pytest_sessionfinish(session, exitstatus):
     global _written
     if _written:
@@ -828,35 +1009,11 @@ def pytest_sessionfinish(session, exitstatus):
     for path in sorted(unknown)[:20]:
         print(f"[trace_conftest] unknown-scope read: {path}", file=sys.stderr)
 
-    keys_payload: dict[str, dict[str, list[str]]] = {}
-    pair_count = 0
-    for bucket, by_name in _keyreads.items():
-        entry: dict[str, list[str]] = {}
-        for name, keys in by_name.items():
-            if not name:
-                continue  # reconstructed copies lose the name; drop them
-            text = sorted({_key_text(key) for key in keys})
-            entry[name] = text
-            pair_count += len(text)
-        if entry:
-            keys_payload[bucket] = entry
-    dialects_payload = {
-        bucket: sorted(names) for bucket, names in _dialects.items() if names
-    }
-    dynamic = {
-        "dialects": dialects_payload,
-        "keys": keys_payload,
-        "names": _names,
-        "skipped": sorted(_skipped),
-        "stats": {
-            "patched_modules": len(_patched_modules),
-            "proxied_names": len(_names),
-            "key_pairs": pair_count,
-            "sink_pairs": sum(len(keys) for keys in _SINK.values()),
-            "dialect_buckets": len(dialects_payload),
-        },
-    }
+    dynamic = _dynamic_payload()
     _write_json(DYNAMIC_OUT, dynamic)
+    keys_payload = dynamic["keys"]
+    dialects_payload = dynamic["dialects"]
+    pair_count = dynamic["stats"]["key_pairs"]
     print(
         f"[trace_conftest] dynamic={DYNAMIC_OUT} proxied_names={len(_names)} "
         f"key_buckets={len(keys_payload)} key_pairs={pair_count} "
@@ -872,3 +1029,16 @@ def pytest_sessionfinish(session, exitstatus):
 # seen.  Modules already imported (unusual) are patched immediately.
 _install_import_hook()
 _instrument_loaded()
+_install_pool_wrapper()
+if SUBPROCESS_TRACE and not CHILD_MODE:
+    # Spawned workers inherit this process' environment: the sitecustomize shim
+    # (br_trace_boot.py, loaded from a .pth) only instruments a process when the
+    # flag is set, so workers get the same hooks while the pytest parent keeps
+    # driving its own coverage instance.
+    os.environ["BR_CHILD_TRACE"] = "1"
+elif CHILD_MODE:
+    atexit.register(_child_exit)
+    print(
+        f"[trace_conftest] subprocess worker instrumentation active pid={os.getpid()}",
+        file=sys.stderr,
+    )

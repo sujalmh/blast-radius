@@ -37,7 +37,18 @@ COPY trace_conftest.py /mapgen/trace_conftest.py
 COPY gen_maps.py /mapgen/gen_maps.py
 COPY run_maps.sh /mapgen/run_maps.sh
 COPY inspect_maps.py /mapgen/inspect_maps.py
+COPY br_trace_boot.py /mapgen/br_trace_boot.py
+COPY br_coverage.coveragerc /work/br_coverage.coveragerc
 RUN chmod 0755 /mapgen/run_maps.sh
+
+# Subprocess tracing (MAPS_SPEC v2): every interpreter in this image -- in
+# particular the spawn workers of tests/test_optimizer.py and
+# tests/test_executor.py -- runs br_trace_boot at site startup.  It is a no-op
+# unless BR_CHILD_TRACE=1, which only the traced pytest run sets.
+RUN SITE="$(python -c 'import site; print(site.getsitepackages()[0])')" \
+    && cp /mapgen/br_trace_boot.py "$SITE/br_trace_boot.py" \
+    && printf 'import br_trace_boot\n' > "$SITE/zz_blastradius_trace.pth" \
+    && python -c 'import br_trace_boot'
 
 WORKDIR /work/sqlglot
 

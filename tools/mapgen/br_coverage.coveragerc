@@ -1,0 +1,13 @@
+# Config consumed by coverage.process_startup() in spawned test workers
+# (COVERAGE_PROCESS_START=/work/br_coverage.coveragerc, exported by run_maps.sh).
+#
+# parallel = true    each process writes .coverage.<host>.<pid>.<rand>; the
+#                    pytest parent does the same via Coverage(data_suffix=True),
+#                    and run_maps.sh merges everything with `coverage combine`.
+# source = sqlglot   identical to the parent's Coverage(source=["sqlglot"]), so
+#                    worker data has the same file set the map generator reads.
+[run]
+parallel = true
+branch = false
+source = sqlglot
+data_file = /work/.coverage
