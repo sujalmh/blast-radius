@@ -2095,20 +2095,31 @@ def build_keyreads(
 ) -> tuple[dict, dict[str, int]]:
     """maps/keyreads.json.gz: (test, NAME, key) pairs + the safety table."""
     known = set(test_ids)
+    by_file: dict[str, list[str]] = {}
+    for test_id in test_ids:
+        by_file.setdefault(_test_file_of(test_id), []).append(test_id)
+    expand = _bucket_expander(by_file, known)
     stats = {"tests": 0, "pairs": 0, "names": 0, "unclassified": 0, "unplaced": 0}
-    exposure: dict[str, list[list[str]]] = {}
+    exposure: dict[str, set[list[str]]] = {}
     for bucket, by_name in (dynamic.get("keys") or {}).items():
-        if bucket not in known:
-            continue  # module-scope / unknown reads: not attributable to a test
+        tests = expand(bucket)
+        if not tests:
+            continue  # unknown / spare bucket: not attributable to a test
+        # ``module:<tests/file.py>`` buckets are setup/teardown (class-fixture)
+        # reads -- see trace_conftest's phase rule (W1k).  They apply to every
+        # test of that file, which is a sound superset (only over-selects).
         pairs: set[tuple[str, str]] = set()
         for name, keys in by_name.items():
             if not isinstance(name, str) or not name:
                 continue
             for key in keys:
                 pairs.add((name, str(key)))
-        if pairs:
-            exposure[bucket] = [list(pair) for pair in sorted(pairs)]
-            stats["names"] += len({name for name, _ in pairs})
+        if not pairs:
+            continue
+        ordered = sorted(pairs)
+        for test_id in tests:
+            exposure.setdefault(test_id, set()).update(ordered)
+        stats["names"] += len({name for name, _ in pairs})
     stats["tests"] = len(exposure)
     stats["pairs"] = sum(len(pairs) for pairs in exposure.values())
 
@@ -2126,7 +2137,12 @@ def build_keyreads(
             entry[name] = "opaque"
             usage_kind[rel] = dict(sorted(entry.items()))
             stats["unclassified"] += 1
-    return {"exposure": dict(sorted(exposure.items())), "usage_kind": usage_kind}, stats
+    exposure_payload = {
+        test_id: [list(pair) for pair in sorted(pairs)]
+        for test_id, pairs in sorted(exposure.items())
+        if pairs
+    }
+    return {"exposure": exposure_payload, "usage_kind": usage_kind}, stats
 
 
 # ------------------------------------------------------------------- classes

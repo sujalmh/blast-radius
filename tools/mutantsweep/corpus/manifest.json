@@ -187,6 +187,17 @@
       "patch": "control_enum_dialect.patch",
       "sha256": "ab4e8b81d930769b54f4e831fe254e12a83651669c075149c7e86adbe2b4e980",
       "diff_lines": 11
+    },
+    {
+      "id": "gz_fixture_corrupt",
+      "kind": "fixture",
+      "group": "f",
+      "file": "tests/fixtures/optimizer/tpc-h/lineitem.csv.gz",
+      "line": 1,
+      "summary": "first lineitem data row: l_extendedprice `11763.84` -> `11763,84` (binary .gz rewrite; python infers str, duckdb raises ConversionException)",
+      "patch": "gz_fixture_corrupt.patch",
+      "sha256": "ed877250cf6b0282e946741ebc83edd0ac1133b908775d7bd485958b5d48c680",
+      "diff_lines": 11648
     }
   ]
 }

@@ -8,11 +8,18 @@ session:
 1. File reads (``maps/fixtures.json.gz`` input).  Wraps ``builtins.open``,
    ``io.open``, ``codecs.open``, ``os.open`` and
    ``pathlib.Path.{open,read_text,read_bytes}`` to record which files inside
-   the checkout each test reads.  Reads that happen while a test is running are
-   attributed to that test's node id.  Reads with no current test (module
-   import, session fixtures) are attributed to the module bucket
-   ``"module:<tests/... .py>"`` of the file being collected/imported, or to
-   ``"__unknown__"`` when no owning file can be determined.
+   the checkout each test reads.  Reads that happen while a test is *running*
+   (its call phase) are attributed to that test's node id.  Reads made while a
+   test's ``setup`` / ``teardown`` phase runs -- ``setUpClass`` /
+   ``setUp`` / fixture finalisers -- are class/module-scope work: they are
+   attributed to the module bucket ``"module:<tests/... .py>"`` of the test's
+   own file, which ``gen_maps.py`` expands to every test of that file.  A
+   ``TestExecutor.setUpClass`` that loads 32 ``.csv.gz`` tables therefore maps
+   those tables to *all* executor tests instead of charging them to whichever
+   test happened to run first (W1k).  Reads with no current test (collection,
+   module import, session fixtures) use the same module bucket of the file
+   being collected/imported, or ``"__unknown__"`` when no owning file can be
+   determined.
 
 2. Coverage contexts (``maps/coverage.bin.gz`` input).  Drives coverage.py
    manually so every test gets its own context: coverage starts after
@@ -20,19 +27,22 @@ session:
    ``switch_context(nodeid)`` is called around every test protocol
    (setup + call + teardown).
 
-3. Dialect exposure (``maps/dialects.json.gz`` input).  Patches the three
+3. Dialect exposure (``maps/dialects.json.gz`` input).  Patches the four
    chokepoints every dialect resolution goes through --
    ``Dialect.get_or_raise`` (the public resolver used by ``parse_one`` /
    ``sqlglot.transpile`` / ``expr.sql(dialect=...)``), ``Dialect.get`` (class
-   lookup) and ``Dialect.__init__`` (direct construction such as
-   ``Snowflake(...)`` or the ``result(**kwargs)`` inside ``get_or_raise``) --
-   and records the resolved *registered* dialect key (``Dialect._classes``
-   reverse lookup, so ``TSQL`` -> ``"tsql"``) for the current test.  The base
-   ``Dialect`` class is recorded as ``"default"``.  Fixture-driven resolution
-   (``# dialect: x`` headers) funnels through the same chokepoints
-   (``Validator.parse_one`` -> ``parse_one(read=self.dialect)``).  Resolutions
-   outside a test go to the same ``module:<tests/file.py>`` buckets the file
-   tracer uses, and ``gen_maps.py`` expands them to all tests of that file.
+   lookup), ``Dialect.__getitem__`` on the ``_Dialect`` metaclass (the
+   ``Dialect["duckdb"]`` subscript form) and ``Dialect.__init__`` (direct
+   construction such as ``Snowflake(...)`` or the ``result(**kwargs)`` inside
+   ``get_or_raise``) -- and records the resolved *registered* dialect key
+   (``Dialect._classes`` reverse lookup, so ``TSQL`` -> ``"tsql"``) for the
+   current test.  The base ``Dialect`` class is recorded as ``"default"``.
+   Fixture-driven resolution (``# dialect: x`` headers) funnels through the
+   same chokepoints (``Validator.parse_one`` -> ``parse_one(read=self.dialect)``).
+   Resolutions outside a test -- and, since W1k, resolutions during a test's
+   setup/teardown phase (class fixtures) -- go to the same
+   ``module:<tests/file.py>`` buckets the file tracer uses, and
+   ``gen_maps.py`` expands them to all tests of that file.
 
 4. Key reads (``maps/keyreads.json.gz`` input).  Every module-level and
    class-body ``dict``/``list``/``tuple``/``set``/``frozenset`` value in
@@ -69,7 +79,10 @@ session:
 
    Key reads raised while a sqlglot module is executing are routed to the sink
    (``_PatchLoader.exec_module``), so a dialect imported lazily inside a test
-   never has its import-time merges attributed to that test.
+   never has its import-time merges attributed to that test.  Since W1k the
+   *phase* rule applies here too: a constant read by a test's setup/teardown
+   (class fixtures) goes to the ``module:<tests/file.py>`` bucket for that
+   file, not to whichever test happened to run first.
 
    NAME is the bare module-level name, or ``Class.NAME`` for class bodies
    (``Qualname.NAME`` for nested classes, e.g. ``Dialect.Tokenizer.KEYWORDS``).
@@ -188,6 +201,12 @@ _IGNORE_SUFFIXES = (".pyc", ".pyo")
 _reads: dict[str, set[str]] = {}
 _current_test: str | None = None
 _current_file: str | None = None
+# Which pytest phase of the current test is running.  ``"call"`` means the
+# test body itself (per-test attribution); anything else is setup/teardown,
+# i.e. class- or module-scoped work that is attributed to the file bucket (W1k).
+# The default is ``"call"`` so spawned workers -- which only ever run call-phase
+# pool tasks -- keep per-test attribution without extra wiring.
+_phase = "call"
 _coverage = None
 _written = False
 
@@ -254,9 +273,18 @@ def _relative(abspath: str) -> str | None:
     return abspath[len(ROOT) + 1 :].replace(os.sep, "/")
 
 
+def _file_bucket(test_id: str) -> str:
+    """``module:<test file>`` -- the class/module-scope bucket of a test id."""
+    return "module:" + test_id.split("::", 1)[0]
+
+
 def _bucket() -> str:
     if _current_test is not None:
-        return _current_test
+        if _phase == "call":
+            return _current_test
+        # setup/teardown: class/module-scope work, expanded by gen_maps.py to
+        # every test of the file (a sound superset; only over-selects).
+        return _file_bucket(_current_test)
     if _current_file is not None:
         return "module:" + _current_file
     return "__unknown__"
@@ -1034,6 +1062,7 @@ def _install_dialect_hooks(dialect_module) -> None:
         metaclass = type(dialect)
         original_get = metaclass.__dict__["get"]
         original_get_raise = dialect.__dict__["get_or_raise"]
+        original_getitem = metaclass.__dict__["__getitem__"]
 
         def patched_get(cls, key, default=None):
             result = original_get.__func__(cls, key, default)
@@ -1046,10 +1075,21 @@ def _install_dialect_hooks(dialect_module) -> None:
             _dia_record(type(result))
             return result
 
+        # ``Dialect["duckdb"]`` is the other half of ``Dialect.get`` -- both are
+        # the metaclass lookup that ``_classes`` exists for -- so it is a
+        # resolution chokepoint too (W1k).  A special method must live on the
+        # metaclass, and it stays a ``classmethod`` exactly like the original so
+        # the subscript slot resolves it the same way.
+        def patched_getitem(cls, key):
+            result = original_getitem.__func__(cls, key)
+            _dia_record(result)
+            return result
+
         setattr(dialect, "get", classmethod(patched_get))
         setattr(dialect, "get_or_raise", classmethod(patched_get_or_raise))
+        setattr(metaclass, "__getitem__", classmethod(patched_getitem))
     except Exception as error:  # noqa: BLE001
-        _skipped.add(f"dialect.get/get_or_raise ({type(error).__name__})")
+        _skipped.add(f"dialect.get/get_or_raise/__getitem__ ({type(error).__name__})")
 
     print(
         f"[trace_conftest] dialect hooks installed on {getattr(dialect, '__module__', '?')}",
@@ -1212,10 +1252,13 @@ def _br_task(test_id, fn, *args, **kwargs):
 
     Set before ``fn`` runs so the dialect hooks and the container proxies that
     execute inside the worker land in the right test bucket, then switch the
-    coverage context (parallel-mode data is saved at process exit).
+    coverage context (parallel-mode data is saved at process exit).  A pool task
+    is call-phase work for that test (there is no other test in the worker), so
+    the phase flag is pinned to ``"call"`` for its duration.
     """
-    global _current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES, _CHILD_TASKS
-    previous = (_current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES)
+    global _current_test, _phase, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES, _CHILD_TASKS
+    previous = (_current_test, _phase, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES)
+    _phase = "call"
     if test_id:
         _current_test = test_id
         if KEYREADS_ENABLED:
@@ -1249,7 +1292,7 @@ def _br_task(test_id, fn, *args, **kwargs):
                 coverage_instance.switch_context("")
             except Exception:  # noqa: BLE001
                 pass
-        _current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES = previous
+        _current_test, _phase, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES = previous
         _CHILD_TASKS += 1
         if _CHILD_TASKS % _CHILD_FLUSH_EVERY == 0:
             _child_flush()
@@ -1401,12 +1444,19 @@ def pytest_collection_finish(session):
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
-    global _current_test, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES
+    global _current_test, _phase, _CUR_KEYS, _CUR_DIA, _CUR_CLASSES
     _current_test = item.nodeid
+    # Setup/teardown work of a test (``setUpClass``, ``setUp``, fixtures,
+    # finalisers) is class/module scope, so the dialect and constant-key traces
+    # start in the *file* bucket; ``pytest_runtest_call`` switches both to the
+    # test's own bucket for the body and back afterwards (W1k).  Coverage keeps
+    # one context per test for the whole protocol, exactly as before.
+    _phase = "setup"
+    file_bucket = _file_bucket(item.nodeid)
     if KEYREADS_ENABLED:
-        _CUR_KEYS = _keyreads.setdefault(item.nodeid, defaultdict(set))
+        _CUR_KEYS = _keyreads.setdefault(file_bucket, defaultdict(set))
     if DIALECTS_ENABLED:
-        _CUR_DIA = _dialects.setdefault(item.nodeid, set())
+        _CUR_DIA = _dialects.setdefault(file_bucket, set())
     if CLASSES_ENABLED:
         _CUR_CLASSES = _classes.setdefault(item.nodeid, set())
     if _coverage is not None:
@@ -1418,6 +1468,7 @@ def pytest_runtest_protocol(item, nextitem):
         yield
     finally:
         _current_test = None
+        _phase = "call"
         _CUR_KEYS = _SINK
         _CUR_DIA = None
         _CUR_CLASSES = _SINK_CLASSES
@@ -1426,6 +1477,23 @@ def pytest_runtest_protocol(item, nextitem):
                 _coverage.switch_context("")
             except Exception:  # noqa: BLE001
                 pass
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """Switch the key/dialect sinks to the test bucket for the call phase."""
+    global _phase, _CUR_KEYS, _CUR_DIA
+    saved = (_phase, _CUR_KEYS, _CUR_DIA)
+    _phase = "call"
+    if _current_test is not None:
+        if KEYREADS_ENABLED:
+            _CUR_KEYS = _keyreads.setdefault(item.nodeid, defaultdict(set))
+        if DIALECTS_ENABLED:
+            _CUR_DIA = _dialects.setdefault(item.nodeid, set())
+    try:
+        yield
+    finally:
+        _phase, _CUR_KEYS, _CUR_DIA = saved
 
 
 def _key_text(key) -> str:
@@ -1482,11 +1550,9 @@ def _dynamic_payload() -> dict:
             "patched_modules": len(_patched_modules),
             "proxied_names": len(_names),
             "key_pairs": pair_count,
-            "sink_pairs": sum(len(keys) for keys in _SINK.values()),
             "dialect_buckets": len(dialects_payload),
             "class_buckets": len(classes_payload),
             "class_pairs": sum(len(names) for names in classes_payload.values()),
-            "sink_classes": len(_SINK_CLASSES),
             "coarse_names": len(_bulk),
             "repatched_classes": _REPATCHED["classes"],
             "repatched_rounds": _REPATCHED["rounds"],
@@ -1530,6 +1596,10 @@ def pytest_sessionfinish(session, exitstatus):
         f"dialect_buckets={len(dialects_payload)} "
         f"class_buckets={len(dynamic['classes'])} "
         f"class_pairs={dynamic['stats']['class_pairs']} "
+        # Sink counters are diagnostics only: they depend on import order across
+        # spawned workers, so they are printed but never written into the maps
+        # (that keeps two identical runs byte-identical).
+        f"sink_pairs={sum(len(keys) for keys in _SINK.values())} "
         f"sink_classes={len(_SINK_CLASSES)} skipped={len(_skipped)}",
         file=sys.stderr,
     )

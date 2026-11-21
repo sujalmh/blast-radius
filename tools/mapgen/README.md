@@ -135,6 +135,57 @@ Findings (all reproducible from the bundle):
   pre-existing coverage cost of `test_parser.py::test_max_nodes` (112 s traced,
   91 s with `BR_KEYREADS=0`), not the new proxying.
 
+## W1k plumbing run: setup-phase (class-fixture) reads (~66 s)
+
+A `TestExecutor.setUpClass` loads all 32 `tests/fixtures/optimizer/tpc-{h,ds}/*.csv.gz`
+tables plus the two `tpc-*.sql` fixtures before any test runs, so the old trace
+charged every one of those reads to the first test executed
+(`test_agg_order`) and the fixture map listed exactly one reader. The plugin now
+tracks the pytest phase (`pytest_runtest_call` flips a flag): reads made in
+setup/teardown go to `module:<tests/file.py>` and `gen_maps.py` expands that
+bucket to every test of the file, while call-phase reads stay per-test. The same
+rule applies to the dialect and constant-key traces, and
+`Dialect.__getitem__` (`Dialect["duckdb"]`, the metaclass subscript half of
+`Dialect.get`) is a resolution chokepoint next to `get`/`get_or_raise`/`__init__`.
+
+```sh
+mkdir -p /tmp/w1k-out1 /tmp/w1k-out2
+for out in /tmp/w1k-out1 /tmp/w1k-out2; do
+  docker run --rm --platform linux/amd64 -v "$out":/out blast-mapgen /out     tests/test_executor.py tests/test_transpile.py
+done
+```
+
+* Fixture map after the fix: the 32 `.csv.gz` and both `tpc-*.sql` fixtures
+  each list **all 60** `tests/test_executor.py` tests (bucket
+  `module:tests/test_executor.py`); call-phase reads are unchanged and stay
+  per-test (`tests/fixtures/identity.sql` -> `test_identity` only,
+  `partial.sql` -> `test_partial`, `pretty.sql` -> `test_pretty`).
+* Raw bucket dump (parent + 17 child traces) of `tests/test_executor.py`:
+  read trace `module:tests/test_executor.py: 34 files`, and no setup-phase
+  dialect/key bucket at all for that file (its `setUpClass` only touches duckdb
+  and `Table`). A synthetic probe with a dialect + `Tokenizer.KEYWORDS` read in
+  `setUpClass` records exactly: `module:tests/test_w1k_probe.py: ['snowflake']`
+  and `['SELECT']` for setup, `test_a: ['duckdb'] / ['FROM']` and
+  `test_b: ['tsql'] / ['WHERE']` for the call phase, and
+  `Dialect["duckdb"]`/`["tsql"]`/`get("oracle")` record `duckdb`, `tsql`,
+  `oracle` through the new `__getitem__` hook.
+* Mutant `tools/mutantsweep/corpus/gz_fixture_corrupt` (one `l_extendedprice`
+  field of one `tpc-h/lineitem.csv.gz` line) fails
+  `tests/test_executor.py::TestExecutor::test_optimized_tpch` in the full suite
+  (`ground/gz_fixture_corrupt.json`, 12 failed subtests). The committed map
+  still lists only `test_agg_order` for that file (a +300 s miss); the traced
+  pipeline on the mutated checkout lists all 60 executor tests, i.e. it covers
+  the ground truth.
+* Determinism: two identical plumbing runs are byte-identical for all 14 files
+  including `MANIFEST.json` (the order-dependent `sink_pairs`/`sink_classes`
+  counters moved to stderr only).
+* Parity: plain `88 passed, 1478 subtests passed` (35.1 s) vs traced
+  `88 passed, 1478 subtests passed` (50.6 s) on the same two files.
+* Sizes for that slice: `fixtures.json.gz` 2 312 B, `dialects.json.gz` 2 049 B,
+  `keyreads.json.gz` 215 690 B (counted for `test_executor.py` +
+  `test_transpile.py`; the setup-phase bucket replicating pairs across a file's
+  tests is what the keyread expansion adds — worth a glance in the full regen).
+
 ## Stages
 
 1. **Build** – `fetch_pin.py` downloads `codeload.github.com/…/tar.gz/<sha>`
@@ -260,7 +311,7 @@ Findings (all reproducible from the bundle):
 | `usage.json.gz` | `{path: {NAME: [same-file reference lines]}}` — `Name.id` **and** `Attribute.attr` matches, definition lines excluded |
 | `usage_refs.json.gz` | `{NAME: {referencing file: [lines]}}` — same v2 reference rule, all files (see deviations) |
 | `usage_style.json.gz` | `{NAME: {file: {"self_lines": [...], "class_lines": [...], "instance_lines": [...]}}}` — the same references split 3 ways by receiver kind (L4) |
-| `fixtures.json.gz` | `{non-.py file: [test ids]}` + `__test_files__` + `__shared__` |
+| `fixtures.json.gz` | `{non-.py file: [test ids]}` + `__test_files__` + `__shared__` (setup/teardown reads land on the whole test file, W1k) |
 | `dialects.json.gz` | `{"exposure": {test: [dialect keys]}, "file_scope": {path: key}, "class_scope": {path: {Class: key}}}` |
 | `keyreads.json.gz` | `{"exposure": {test: [[NAME, KEY], …]}, "usage_kind": {path: {NAME: "keyable"\|"opaque"}}}` |
 | `testimports.json.gz` | `{tests/test_x.py: [sqlglot.module, …]}`, static transitive top-level imports (incl. `tests/**.py` helpers) |
@@ -277,7 +328,12 @@ Findings (all reproducible from the bundle):
 `exposure[test]` is the set of dialect keys the test resolved, plus `"default"`
 for the base dialect; a test that resolved nothing at all also gets
 `["default"]` (conservative: it can then never be narrowed away by a
-dialect-scoped change). `file_scope` is static: `sqlglot/dialects/<name>.py`,
+dialect-scoped change). Since W1k a key resolved during a test's setup/teardown
+phase (class fixtures) is recorded in the `module:<tests/file.py>` bucket and
+expanded to every test of that file instead of being charged to whichever test
+ran first; `Dialect.__getitem__` (the metaclass lookup behind
+`Dialect["duckdb"]`) is a chokepoint alongside `get` / `get_or_raise` /
+`__init__`. `file_scope` is static: `sqlglot/dialects/<name>.py`,
 `sqlglot/generators/<name>.py`, `sqlglot/parsers/<name>.py` → the registered
 key from `sqlglot/dialects/__init__.py:DIALECTS` (so `python.py`, `base.py`,
 `dialect.py`, `__init__.py` are absent). `class_scope` is an additive
@@ -292,7 +348,10 @@ the bare module-level name, or `Class.NAME` for class bodies (`Dialect.
 Tokenizer.KEYWORDS` for nested classes); `KEY` is `str` for string keys,
 `repr`-style for anything else (`"1"` for `1`, `"slice(1, 2, None)"` for a
 slice, `"<DType.INT: …>"` for enum members). Reads with no current test
-(import time) are dropped — they are not attributable to a test.
+(import time) are dropped — they are not attributable to a test. Reads made
+during a test's setup/teardown phase (W1k) are attributed to the
+`module:<tests/file.py>` bucket of that test's file and expanded to every test
+of the file (a sound superset), instead of landing on the first test that ran.
 
 `usage_kind[path][NAME]` is the safety table. A name is `keyable` only when
 **every** reference to it anywhere in `sqlglot/` is one of `X[k]` (load),

@@ -1,0 +1,14 @@
+{
+  "id": "gz_fixture_corrupt",
+  "patch": "corpus/gz_fixture_corrupt.patch",
+  "failing": [
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+  ],
+  "passed": 1620,
+  "failed": 12,
+  "skipped": 1,
+  "errors": [],
+  "error_count": 0,
+  "wall_s": 82.267,
+  "summary": "12 failed, 1620 passed, 1 skipped, 25428 subtests passed in 81.45s (0:01:21)"
+}
